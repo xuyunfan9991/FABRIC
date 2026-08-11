@@ -1,0 +1,45 @@
+reference_build: GRCh38
+coordinate_system_internal: 0-based-half-open
+
+sources:
+  rna_counts: /home1/xyf/project/Multi_Omic/data/gene_matrix_Illumina/gene_matrix_Illumina.h5ad
+  rna_cell_metadata: /home1/xyf/project/Multi_Omic/data/gene_matrix_Illumina/cell_meta_final.aligned.tsv
+  full_rna_glue_embedding: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/glue/combined_glue_5kb_embedding.h5ad
+  full_rna_glue_provenance: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/glue/run_glue_5kb_provenance.json
+  full_rna_consensus_peak_bed: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/consensus_peaks.bed
+  full_rna_atac_peak_counts: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/peak_matrix_with_developmental_system.h5ad
+  full_rna_peak_provenance: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/provenance.json
+  full_rna_peak_validation: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/validation_summary.json
+  graph_discovery_pointer: /home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/artifacts/graph/CURRENT.json
+  graph_generation: /home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/artifacts/graph/generations/d51be2344bb0e5acde0e5cf9b8e5aded7b38c2666a639c836051f7b48f714bc4
+  compatibility_ec: /home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/supervision/.artifact/generations/c6c36a3a3144179de935816e3b531df0e3619fcd66d94292d360d5184abf3ab7/outputs/supervision/compatibility_equivalence_classes.parquet
+  supervision_manifest: /home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/supervision/.artifact/generations/c6c36a3a3144179de935816e3b531df0e3619fcd66d94292d360d5184abf3ab7/outputs/supervision/supervision_manifest.json
+  cell_split: /home2/xyf/project/PRISM/data/final_multimodal_simple_12run_v1/D2/split_manifest/generations/87e623496acaa2799f4fdcbe6befbc965b70ca7324eada288d11d4c7965195d9/outputs/split_rows.parquet
+  cell_split_manifest: /home2/xyf/project/PRISM/data/final_multimodal_simple_12run_v1/D2/split_manifest/generations/87e623496acaa2799f4fdcbe6befbc965b70ca7324eada288d11d4c7965195d9/outputs/split_manifest.json
+  reference_fasta: /home2/xyf/project/PRISM/data/reference/genome.fa
+  reference_fasta_index: /home2/xyf/project/PRISM/data/reference/genome.fa.fai
+  transcript_model_gtf: /home2/xyf/project/PRISM/data/new_bam/gtf/20260110_OUT.transcript_models_reid.sorted.gtf
+  rna_gene_gtf: /home1/xyf/data/gtf/grch38_10x/refdata-gex-GRCh38-2020-A/genes/genes.gtf
+  dna_motif_library: /home2/xyf/project/PRISM/data/motifs/jaspar2026_core_vertebrates_nonredundant.meme
+  dna_motif_index: /home2/xyf/project/PRISM/data/motifs/jaspar2026_core_vertebrates_motif_index.tsv
+  rna_motif_directory: /home2/xyf/project/PRISM/data/motifs/raw/cisbp_rna_2.00_human/pwms_all_motifs
+  rna_motif_gene_map: /home2/xyf/project/PRISM/data/motifs/cisbp_rna_human_motif_gene_map.tsv
+
+derived:
+  fabric_context_neighbors: /home2/xyf/project/FABRIC/data/processed/motif_events/cell_atac_neighbors.parquet
+
+expected:
+  rna_count_shape: [217933, 32351]
+  broad_system_rna_count: 205864
+  glue_shape: [438338, 0]
+  glue_embedding_shape: [438338, 50]
+  glue_rna_count: 205864
+  glue_atac_count: 232474
+  atac_peak_count_shape: [232474, 753753]
+  consensus_peak_count: 753753
+  supervised_split_count: 167235
+  graph_node_count: 295904
+  graph_edge_count: 427160
+  legal_path_count: 72749
+  path_edge_row_count: 999278
+  compatibility_ec_count: 59545590

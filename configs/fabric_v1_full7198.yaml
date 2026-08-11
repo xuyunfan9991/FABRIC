@@ -1,0 +1,68 @@
+contract: FABRIC_ARCHITECTURE_V1
+status: AUDIT_REQUIRED_NO_FORMAL_TRAIN
+external_inputs: data/external_inputs.yaml
+generalization_claim_class: transductive_supervised_cell_holdout
+regulatory_interpretation_class: motif_and_cell_context_supported_association
+target_gene_count: 7198
+
+data:
+  reuse_documented_cell_split: null
+  target_sum_rna: null
+  target_sum_atac: null
+  state_pca_dim: null
+  atac_neighbors:
+    exact_stage: true
+    stage_field: stage_scanvi
+    donor_id_field: sample_id
+    donor_eligibility_rule: null
+    donor_eligibility_path: null
+    k: null
+    weighting: softmax_negative_euclidean_distance
+    temperature: null
+
+factor_identity:
+  reviewed_mapping: null
+
+choices:
+  rank_tolerance: null
+  minimum_informative_molecule_mass: null
+  minimum_alternative_support: null
+
+motifs:
+  peak_support_path: null
+  dna_window_bp: null
+  rna_window_bp: null
+  dna_minimum_relative_score: null
+  rna_minimum_relative_score: null
+  dna_events_per_choice_cap: null
+  rna_events_per_choice_cap: null
+
+gates:
+  minimum_valid_molecule_mass: null
+  minimum_weighted_variance: null
+
+model:
+  cis_hidden_dim: null
+  cis_heads: null
+  state_rank: null
+  dna_rank: null
+  rna_rank: null
+  path_length_prior_weight: null
+
+training:
+  seeds: null
+  learning_rate: null
+  weight_decay: null
+  max_epochs: null
+  variants: [cis, state, state_dna, state_rna, state_dna_rna]
+  formal_full7198_authorized: false
+
+admission:
+  minimum_b0_validation_improvement: null
+  likelihood_exactness_required: true
+  real_fixture_directory: tests/fixtures/real
+
+diagnostic_panel:
+  frozen_gene_ids: null
+  report_rms_delta_vs_event_count_span_cap: true
+  screening_evidence_only: true

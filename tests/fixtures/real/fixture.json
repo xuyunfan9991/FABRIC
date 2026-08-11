@@ -1,0 +1,42 @@
+{
+  "counts": {
+    "ec_molecules": 66,
+    "ec_rows": 66,
+    "edges": 7,
+    "excluded_ec_rows_outside_current_split": 31,
+    "nodes": 7,
+    "path_edges": 10,
+    "paths": 2,
+    "source_ec_molecules": 98,
+    "source_ec_rows": 97,
+    "source_edges": 10,
+    "source_nodes": 9,
+    "source_path_edges": 14,
+    "source_paths": 2,
+    "stale_split_mismatch_rows": 10,
+    "test_rows": 5,
+    "train_rows": 56,
+    "val_rows": 5
+  },
+  "fixed_logit_likelihood_reference": {
+    "molecule_weighted_mean_nll": 1.025382899639435,
+    "path_logits": {
+      "path:ENSG00000275074:ENST00000611621": -0.25,
+      "path:ENSG00000275074:ENST00000613958": 0.75
+    },
+    "row_nll": {
+      "path:ENSG00000275074:ENST00000611621": 1.3132616875182228,
+      "path:ENSG00000275074:ENST00000613958": 0.3132616875182228
+    }
+  },
+  "gene_id": "ENSG00000275074",
+  "normalization": {
+    "cell_id": "remove_exact_RNA__prefix_from_split_only",
+    "graph": "drop_SOURCE_SINK_START_END_and_edges_not_in_path_edge",
+    "split": "inner_join_EC_to_current_D2_split_then_replace_EC_split"
+  },
+  "schema_version": "fabric.real-fixture.v1",
+  "source_cell_split": "/home2/xyf/project/PRISM/data/final_multimodal_simple_12run_v1/D2/split_manifest/generations/87e623496acaa2799f4fdcbe6befbc965b70ca7324eada288d11d4c7965195d9/outputs/split_rows.parquet",
+  "source_compatibility_ec": "/home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/supervision/.artifact/generations/c6c36a3a3144179de935816e3b531df0e3619fcd66d94292d360d5184abf3ab7/outputs/supervision/compatibility_equivalence_classes.parquet",
+  "source_graph_generation": "/home2/xyf/project/PRISM/data/i6_multi7198_terminal_v2/artifacts/graph/generations/d51be2344bb0e5acde0e5cf9b8e5aded7b38c2666a639c836051f7b48f714bc4"
+}

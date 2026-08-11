@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fabric-isoform"
+version = "0.1.0"
+description = "FABRIC V1: factor-aware regulation of compatible isoform paths"
+requires-python = ">=3.11"
+dependencies = [
+  "anndata>=0.12",
+  "h5py>=3.11",
+  "hdf5plugin>=5.0",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=16",
+  "pyfaidx>=0.9",
+  "PyYAML>=6",
+  "scikit-learn>=1.5",
+  "scipy>=1.13",
+  "torch>=2.7",
+  "torch-geometric>=2.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+fabric-train = "fabric.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "external: reads the frozen external normalized-data sources",
+  "gpu: requires CUDA",
+]

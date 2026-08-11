@@ -1,0 +1,19 @@
+# Python caches and packaging artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Local experiment artifacts and derived data
+/runs/
+/outputs/
+/tmp/
+/data/processed/
+
+# Local reference material
+/paper/*.pdf
