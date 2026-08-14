@@ -115,6 +115,7 @@ class OntMatrixKlTarget:
     path_ids: tuple[str, ...]
     path_gene_ids: tuple[str, ...]
     cell_ids: tuple[str, ...]
+    expected_cell_gene_keys: np.ndarray
     matrix_identity: str
     path_identity: str
     split_identity: str
@@ -137,6 +138,31 @@ class OntMatrixKlTarget:
             raise ValueError("ONT KL target path/cell identities must be unique and nonempty")
         if any(not value for value in self.path_gene_ids):
             raise ValueError("ONT KL target gene identities must be nonempty")
+        if self.expected_cell_gene_keys.ndim != 1 or len(self.expected_cell_gene_keys) == 0:
+            raise ValueError(
+                "ONT KL expected validation cell-gene keys must be one-dimensional and nonempty"
+            )
+        if not np.issubdtype(self.expected_cell_gene_keys.dtype, np.integer):
+            raise TypeError("ONT KL expected validation cell-gene keys must be integers")
+        gene_count = len(dict.fromkeys(self.path_gene_ids))
+        if (
+            bool((self.expected_cell_gene_keys < 0).any())
+            or bool(
+                (
+                    self.expected_cell_gene_keys
+                    >= gene_count * len(self.cell_ids)
+                ).any()
+            )
+            or bool(
+                (
+                    self.expected_cell_gene_keys[1:]
+                    <= self.expected_cell_gene_keys[:-1]
+                ).any()
+            )
+        ):
+            raise ValueError(
+                "ONT KL expected validation cell-gene keys must be ordered unique in-range identities"
+            )
         values = self.counts.data
         if (
             not np.isfinite(values).all()
@@ -158,12 +184,20 @@ class OntMatrixKlTarget:
     def load(cls, root: str | Path) -> "OntMatrixKlTarget":
         root = Path(root)
         manifest = json.loads((root / "OntMatrixKlTargetManifest.json").read_text())
-        if manifest.get("schema_version") != "fabric.ont_validation_kl_target.v1":
+        if manifest.get("schema_version") != "fabric.ont_validation_kl_target.v2":
             raise ValueError("unsupported ONT validation KL target schema")
         if manifest.get("test_cells_or_counts_included") is not False:
             raise ValueError("ONT validation KL target must exclude test cells and counts")
         path_axis = pd.read_parquet(root / manifest["path_axis"])
         cell_axis = pd.read_parquet(root / manifest["cell_axis"])
+        expected_axis = pd.read_parquet(
+            root / manifest["expected_cell_gene_axis"],
+            columns=[
+                "expected_instance_order_0based",
+                "gene_order_0based",
+                "cell_order_0based",
+            ],
+        )
         _require_columns(
             path_axis,
             ("path_order_0based", "path_id", "gene_id"),
@@ -174,12 +208,31 @@ class OntMatrixKlTarget:
             ("cell_order_0based", "cell_id", "split"),
             "ONT KL cell axis",
         )
+        _require_columns(
+            expected_axis,
+            (
+                "expected_instance_order_0based",
+                "gene_order_0based",
+                "cell_order_0based",
+            ),
+            "ONT KL expected cell-gene axis",
+        )
         if path_axis["path_order_0based"].tolist() != list(range(len(path_axis))):
             raise ValueError("ONT KL path order is not contiguous")
         if cell_axis["cell_order_0based"].tolist() != list(range(len(cell_axis))):
             raise ValueError("ONT KL cell order is not contiguous")
         if not cell_axis["split"].astype(str).eq("val").all():
             raise ValueError("ONT KL target contains non-validation cells")
+        if not np.array_equal(
+            expected_axis["expected_instance_order_0based"].to_numpy(dtype=np.int64),
+            np.arange(len(expected_axis), dtype=np.int64),
+        ) or len(expected_axis) != manifest.get("expected_cell_gene_count"):
+            raise ValueError("ONT KL expected cell-gene order or count differs")
+        expected_keys = (
+            expected_axis["gene_order_0based"].to_numpy(dtype=np.int64)
+            * len(cell_axis)
+            + expected_axis["cell_order_0based"].to_numpy(dtype=np.int64)
+        )
         counts = sparse.load_npz(root / manifest["counts"]).tocsr()
         if (
             list(counts.shape) != manifest.get("counts_shape")
@@ -191,6 +244,7 @@ class OntMatrixKlTarget:
             path_ids=tuple(path_axis["path_id"].astype(str)),
             path_gene_ids=tuple(path_axis["gene_id"].astype(str)),
             cell_ids=tuple(cell_axis["cell_id"].astype(str)),
+            expected_cell_gene_keys=expected_keys,
             matrix_identity=str(manifest["matrix_identity"]),
             path_identity=str(manifest["path_identity"]),
             split_identity=str(manifest["split_identity"]),
@@ -223,7 +277,9 @@ def compute_validation_ont_matrix_kl(
     path_position = {value: index for index, value in enumerate(target.path_ids)}
     cell_position = {value: index for index, value in enumerate(target.cell_ids)}
     gene_paths: dict[str, tuple[str, ...]] = {}
+    gene_position: dict[str, int] = {}
     for gene_id, path_id in zip(target.path_gene_ids, target.path_ids, strict=True):
+        gene_position.setdefault(gene_id, len(gene_position))
         gene_paths.setdefault(gene_id, tuple())
         gene_paths[gene_id] = (*gene_paths[gene_id], path_id)
 
@@ -232,7 +288,7 @@ def compute_validation_ont_matrix_kl(
     eligible_cell_gene_count = 0
     zero_total_count = 0
     fewer_than_two_count = 0
-    observed_instances: set[tuple[str, str]] = set()
+    observed_expected = np.zeros(len(target.expected_cell_gene_keys), dtype=bool)
     for prediction in predictions:
         gene_id = str(getattr(prediction, "gene_id"))
         path_ids = tuple(map(str, getattr(prediction, "path_ids")))
@@ -257,10 +313,21 @@ def compute_validation_ont_matrix_kl(
         for cell_id, cell_counts, cell_logits in zip(
             cell_ids, counts, logits, strict=True
         ):
-            key = (cell_id, gene_id)
-            if key in observed_instances:
+            key = gene_position[gene_id] * len(target.cell_ids) + cell_position[cell_id]
+            expected_position = int(
+                np.searchsorted(target.expected_cell_gene_keys, key, side="left")
+            )
+            if (
+                expected_position == len(target.expected_cell_gene_keys)
+                or int(target.expected_cell_gene_keys[expected_position]) != key
+            ):
+                raise ValueError(
+                    "ONT KL validation prediction scope differs from the frozen "
+                    f"cell-gene set: unexpected={(cell_id, gene_id)}"
+                )
+            if observed_expected[expected_position]:
                 raise ValueError("ONT KL validation cell-gene instance is duplicated")
-            observed_instances.add(key)
+            observed_expected[expected_position] = True
             total = int(cell_counts.sum())
             if total == 0:
                 zero_total_count += 1
@@ -279,6 +346,20 @@ def compute_validation_ont_matrix_kl(
             weighted_kl_sum += total * max(0.0, kl)
             eligible_ont_count += total
             eligible_cell_gene_count += 1
+    if not bool(observed_expected.all()):
+        gene_ids = tuple(gene_position)
+        missing_keys = target.expected_cell_gene_keys[~observed_expected][:5]
+        missing = [
+            (
+                target.cell_ids[int(key) % len(target.cell_ids)],
+                gene_ids[int(key) // len(target.cell_ids)],
+            )
+            for key in missing_keys
+        ]
+        raise ValueError(
+            "ONT KL validation prediction scope differs from the frozen cell-gene set: "
+            f"missing={missing}"
+        )
     if eligible_ont_count <= 0:
         raise ValueError("ONT matrix KL has zero eligible validation count mass")
     return OntMatrixKlResult(

@@ -181,6 +181,23 @@ class GeneAccumulator:
     observed_cell_umi_keys: set[tuple[str, str]] = field(default_factory=set)
 
 
+def _register_unique_cell_gene_umi(
+    accumulator: GeneAccumulator,
+    *,
+    cell_id: str,
+    gene_id: str,
+    umi: str,
+) -> None:
+    """Admit one molecular identity before any count or artifact mutation."""
+
+    key = (cell_id, umi)
+    if key in accumulator.observed_cell_umi_keys:
+        raise ValueError(
+            f"duplicate primary record for cell-gene-UMI {cell_id}/{gene_id}/{umi}"
+        )
+    accumulator.observed_cell_umi_keys.add(key)
+
+
 def parse_read_name(query_name: str) -> dict[str, str]:
     match = READ_NAME_RE.match(str(query_name))
     if match is None:
@@ -1051,6 +1068,13 @@ def build_compatible_ec_artifact(
                 cell_state = (
                     str(read.get_tag("XM")) if read.has_tag("XM") else "not_available"
                 )
+                accumulator = accumulators.setdefault(gene_id, GeneAccumulator())
+                _register_unique_cell_gene_umi(
+                    accumulator,
+                    cell_id=cell_id,
+                    gene_id=gene_id,
+                    umi=parsed["umi"],
+                )
                 molecule_row = {
                     "molecule_id": str(read.query_name),
                     "read_uuid": parsed["read_uuid"],
@@ -1088,12 +1112,6 @@ def build_compatible_ec_artifact(
                 support[gene_id][f"{split}:{result.final_fate}"] += 1
                 if result.pre_compatibility_qc_pass:
                     support[gene_id][f"{split}:pre_qc"] += 1
-                accumulator = accumulators.setdefault(gene_id, GeneAccumulator())
-                cell_umi_key = (cell_id, parsed["umi"])
-                if cell_umi_key in accumulator.observed_cell_umi_keys:
-                    run_counts["duplicate_cell_gene_umi_primary_records"] += 1
-                else:
-                    accumulator.observed_cell_umi_keys.add(cell_umi_key)
                 ec_key = (
                     cell_id,
                     split,

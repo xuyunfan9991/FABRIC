@@ -16,7 +16,7 @@ import yaml
 from scipy import sparse
 
 import fabric.train as train_module
-from fabric.evaluate import OntMatrixKlTarget
+from fabric.evaluate import OntMatrixKlTarget, compute_validation_ont_matrix_kl
 
 from fabric.train import (
     FULL_COHORT_SCOPE,
@@ -92,6 +92,7 @@ def _toy_ont_target(gene):
         path_ids=gene.path_ids,
         path_gene_ids=(gene.gene_id,) * len(gene.path_ids),
         cell_ids=val_cells,
+        expected_cell_gene_keys=np.arange(len(val_cells), dtype=np.int64),
         matrix_identity="toy-ont-matrix",
         path_identity="toy-path-axis",
         split_identity="toy-validation-split",
@@ -679,6 +680,30 @@ def test_monitor_runs_once_after_each_epoch_and_cannot_change_checkpoint():
     assert "train_nll" not in right.history
     for key, value in left.model.state_dict().items():
         torch.testing.assert_close(right.model.state_dict()[key], value, atol=0, rtol=0)
+
+
+def test_ont_kl_rejects_an_incomplete_validation_prediction_scope():
+    gene = make_toy_genes()[0]
+    config = _one_epoch_config()
+    model = build_paired_models(gene, config["model"], seed=7, device="cpu")["full"]
+    snapshot = evaluate_split(
+        [gene],
+        model,
+        condition="full",
+        split="val",
+        model_config=config["model"],
+        resources=config["resources"],
+    )
+    prediction = snapshot.predictions[0]
+    incomplete = replace(
+        prediction,
+        cell_ids=prediction.cell_ids[:-1],
+        path_logits=prediction.path_logits[:-1],
+    )
+    with pytest.raises(ValueError, match="prediction scope differs"):
+        compute_validation_ont_matrix_kl(
+            replace(snapshot, predictions=(incomplete,)), _toy_ont_target(gene)
+        )
 
 
 def test_one_run_is_end_to_end_and_writes_v2_artifacts(tmp_path):

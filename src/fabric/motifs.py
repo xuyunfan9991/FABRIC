@@ -102,6 +102,23 @@ class PWM:
         return int(self.probabilities.shape[0])
 
 
+def transcript_relative_interval(
+    position: int,
+    rel_start: int,
+    rel_end: int,
+    strand: str,
+) -> tuple[int, int]:
+    """Map one transcript-oriented half-open window to genomic coordinates."""
+
+    if rel_end <= rel_start:
+        raise ValueError("transcript-relative interval must have positive width")
+    if strand == "+":
+        return position + rel_start, position + rel_end
+    if strand == "-":
+        return position - rel_end, position - rel_start
+    raise ValueError("transcript-relative interval strand must be + or -")
+
+
 @dataclass(frozen=True)
 class FactorCatalogResult:
     """Frozen factor/entity identities and motif-to-entity mapping."""
@@ -873,12 +890,11 @@ def build_graph_anchor_regions(
         if upstream < 0 or downstream < 0 or upstream + downstream <= 0:
             raise ValueError(f"invalid site flank for {node_type}")
         anchor = int(node.pos_0based)
-        if strand == "+":
-            raw_start, raw_end = anchor - upstream, anchor + downstream
-        else:
-            raw_start, raw_end = anchor - downstream, anchor + upstream
-        start = max(0, gene_start, raw_start)
-        end = min(contig_end, gene_end, raw_end)
+        raw_start, raw_end = transcript_relative_interval(
+            anchor, -upstream, downstream, strand
+        )
+        start = max(0, raw_start)
+        end = min(contig_end, raw_end)
         if end <= start:
             raise ValueError("clipped site window became empty")
         if node_type in {"TSS", "donor"}:
@@ -1001,7 +1017,7 @@ def build_candidate_routes(
                 if not (int(event.start) < region_end and int(event.end) > region_start):
                     continue
                 anchor_position = int(anchor.anchor_position)
-                if int(event.start) < anchor_position < int(event.end):
+                if int(event.start) <= anchor_position < int(event.end):
                     side = "OVERLAP_ANCHOR"
                     signed_distance = np.nan
                 else:

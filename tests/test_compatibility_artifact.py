@@ -16,6 +16,7 @@ from fabric.compatibility_artifact import (
     TECHNICAL_FAILURE_FATE,
     AlignmentEvidence,
     CompatibilityPolicy,
+    GeneAccumulator,
     GenePathCatalog,
     PathEvidence,
     RetainedIntronOpportunity,
@@ -26,6 +27,7 @@ from fabric.compatibility_artifact import (
     _merge_long_read_audits,
     _missing_quantifier_fields,
     _observation_process_config,
+    _register_unique_cell_gene_umi,
     _combine_reconciliation_summaries,
     _reconciliation_summary_partials,
     _sparse_pair_values,
@@ -102,6 +104,19 @@ def _evaluate(evidence: AlignmentEvidence, **overrides):
         _policy(),
         **arguments,
     )
+
+
+def test_duplicate_cell_gene_umi_fails_before_molecule_counting() -> None:
+    accumulator = GeneAccumulator()
+    _register_unique_cell_gene_umi(
+        accumulator, cell_id="cell", gene_id="gene", umi="umi"
+    )
+    with pytest.raises(ValueError, match="cell-gene-UMI cell/gene/umi"):
+        _register_unique_cell_gene_umi(
+            accumulator, cell_id="cell", gene_id="gene", umi="umi"
+        )
+    assert accumulator.ec_counts == Counter()
+    assert accumulator.cell_counts == {}
 
 
 def test_compatible_sets_are_ordered_and_do_not_use_hard_tx_labels() -> None:

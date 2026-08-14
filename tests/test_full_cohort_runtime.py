@@ -93,6 +93,8 @@ def test_real_validation_ont_kl_target_is_g_fit_complete_and_test_absent():
     assert target.counts.nnz == 11_785_211
     assert int(target.counts.sum()) == 23_200_849
     assert len(set(target.path_gene_ids)) == 17_600
+    assert len(target.expected_cell_gene_keys) == manifest["expected_cell_gene_count"]
+    assert manifest["expected_cell_gene_axis"] == "expected_cell_gene_axis.parquet"
     assert target.scope_policy == (
         "likelihood_informative_validation_cell_gene_with_at_least_two_"
         "positive_ont_paths"
@@ -318,7 +320,8 @@ def test_epoch_projection_caps_only_training_and_keeps_evaluation_complete():
     assert "projected_train_evaluation_seconds" not in projection
 
 
-def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron():
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron(strand):
     rows = pd.DataFrame(
         [
             {
@@ -327,7 +330,7 @@ def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron():
                 "resolved_transcript_id": "tx_spliced",
                 "path_order_0based": 0,
                 "chrom": "chr1",
-                "strand": "+",
+                "strand": strand,
                 "exon_starts_0based": [100, 200],
                 "exon_ends_0based_exclusive": [150, 250],
                 "transcript_aliases": ["tx_spliced"],
@@ -338,7 +341,7 @@ def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron():
                 "resolved_transcript_id": "tx_retained",
                 "path_order_0based": 1,
                 "chrom": "chr1",
-                "strand": "+",
+                "strand": strand,
                 "exon_starts_0based": [90],
                 "exon_ends_0based_exclusive": [260],
                 "transcript_aliases": ["tx_retained"],
@@ -355,6 +358,17 @@ def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron():
         "RETAINED_INTRON",
         "EXON_CONTINUATION",
     ]
+    splice = tables.edges.loc[tables.edges["edge_type"].eq("SPLICE")].iloc[0]
+    assert splice.span_bp == 50
+    assert splice.length_bp == 0
+    retained_edge = tables.edges.loc[
+        tables.edges["edge_type"].eq("RETAINED_INTRON")
+    ].iloc[0]
+    assert retained_edge.length_bp == retained_edge.span_bp == 50
+    assert tables.paths.set_index("path_id")["path_length_bp"].to_dict() == {
+        "path_spliced": 100,
+        "path_retained": 170,
+    }
     assert tables.edges["edge_id"].is_unique
 
 

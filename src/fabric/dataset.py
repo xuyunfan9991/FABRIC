@@ -2327,6 +2327,7 @@ def validate_compatibility_artifact(
         "train_policy_identity",
         "validation_policy_identity",
         "test_exposure",
+        "run_counts",
         "artifact_complete",
         "G_fit_freeze_status",
         "test_rows_written",
@@ -2381,6 +2382,19 @@ def validate_compatibility_artifact(
         reasons.append("test_rows_written_before_checkpoint")
     if manifest.get("training_authorized_or_started") is not False:
         reasons.append("compatibility_build_must_not_start_or_authorize_training")
+    run_counts = manifest.get("run_counts")
+    if not isinstance(run_counts, Mapping):
+        reasons.append("invalid_compatibility_run_counts")
+    else:
+        duplicate_count = run_counts.get(
+            "duplicate_cell_gene_umi_primary_records"
+        )
+        if (
+            isinstance(duplicate_count, bool)
+            or not isinstance(duplicate_count, (int, np.integer))
+            or int(duplicate_count) != 0
+        ):
+            reasons.append("duplicate_cell_gene_umi_primary_records_detected")
     if manifest.get("model_isoform_universe") != (
         "resolved_ont_matrix_structural_paths_only"
     ):
