@@ -1,10 +1,9 @@
 """Freeze the real V2 route design and assemble the sole backed dataset.
 
-This module is intentionally specific to ``fabric_v2_real_dataset_v1``.  It
-does not discover alternative inputs or intersect axes to make them fit.  The
-static event vocabulary is split-neutral, dynamic admission/support is fitted
-from train rows only, and production tensors contain train/validation cells
-only because compatible test rows do not exist.
+This module does not discover alternative inputs or intersect axes to make
+them fit.  The static event vocabulary is split-neutral, dynamic
+admission/support is fitted from train rows only, and production tensors
+contain train/validation cells only because compatible test rows do not exist.
 """
 
 from __future__ import annotations
@@ -84,6 +83,14 @@ def _validated_real_dataset_source(root: Path) -> tuple[str, str]:
     if identity.get("source_git_commit") != source_commit:
         raise RuntimeError("real dataset source commit differs from the current source")
     return source_commit, str(identity["created_at_utc"])
+
+
+def _prepared_artifact_identities(
+    real_root: Path, compatible_root: Path
+) -> tuple[str, str]:
+    """Use frozen artifact directory names, independently of build time."""
+
+    return real_root.name, compatible_root.name
 
 
 @dataclass(frozen=True)
@@ -1889,16 +1896,16 @@ def finalize_backed_prepared_dataset(
     if actual_total != expected_mass["train"] + expected_mass["val"]:
         raise ValueError("prepared molecule mass differs from G_fit K^inf mass")
     created_at = datetime.now(timezone.utc).isoformat()
-    source_commit, input_instance = _validated_real_dataset_source(root)
-    compatibility_instance = str(upstream["created_at_utc"])
+    source_commit, _ = _validated_real_dataset_source(root)
+    input_manifest_id, compatibility_artifact_id = _prepared_artifact_identities(
+        root, compatible
+    )
     manifest = {
         "schema_version": "fabric.backed_prepared_dataset.v1",
         "created_at_utc": created_at,
         "source_git_commit": source_commit,
-        "input_manifest_id": f"fabric_v2_real_dataset@{input_instance}",
-        "compatibility_artifact_id": (
-            f"fabric_v2_compatible_ec@{compatibility_instance}"
-        ),
+        "input_manifest_id": input_manifest_id,
+        "compatibility_artifact_id": compatibility_artifact_id,
         "informative_gene_ids": list(g_fit),
         "gene_shards": [
             {"gene_id": value["gene_id"], "relative_path": value["relative_path"]}
