@@ -373,7 +373,7 @@ def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron(str
 
 
 @pytest.mark.parametrize("strand", ["+", "-"])
-def test_real_graph_compiler_rejects_overlapping_retained_intron_components(strand):
+def test_real_graph_compiler_atomizes_overlapping_retained_introns(strand):
     rows = pd.DataFrame(
         [
             {
@@ -411,8 +411,84 @@ def test_real_graph_compiler_rejects_overlapping_retained_intron_components(stra
             },
         ]
     )
-    with pytest.raises(ValueError, match="unresolved overlapping-intron component"):
-        compile_gene_graph_tables(rows)
+    tables = compile_gene_graph_tables(rows)
+    retained = tables.path_edges.loc[
+        tables.path_edges["path_id"].eq("retained")
+    ].merge(tables.edges, on="edge_id", suffixes=("_path", ""))
+    retained_atoms = retained.loc[retained["edge_type"].eq("RETAINED_INTRON")]
+    assert sorted(
+        retained_atoms[["start_0based", "end_0based_exclusive"]]
+        .itertuples(index=False, name=None)
+    ) == [(150, 180), (180, 220), (220, 250)]
+    assert not (
+        (tables.edges["start_0based"] == 150)
+        & (tables.edges["end_0based_exclusive"] == 250)
+    ).any()
+    assert tables.paths.set_index("path_id")["path_length_bp"].to_dict() == {
+        "splice_a": 130,
+        "splice_b": 130,
+        "retained": 220,
+    }
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_real_graph_compiler_preserves_coincident_acceptor_and_donor(strand):
+    rows = pd.DataFrame(
+        [
+            {
+                "gene_id": "ENSG_TOUCH",
+                "path_id": "splice_left",
+                "resolved_transcript_id": "splice_left",
+                "path_order_0based": 0,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [100, 200],
+                "exon_ends_0based_exclusive": [150, 300],
+                "transcript_aliases": ["splice_left"],
+            },
+            {
+                "gene_id": "ENSG_TOUCH",
+                "path_id": "splice_right",
+                "resolved_transcript_id": "splice_right",
+                "path_order_0based": 1,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [100, 250],
+                "exon_ends_0based_exclusive": [200, 300],
+                "transcript_aliases": ["splice_right"],
+            },
+            {
+                "gene_id": "ENSG_TOUCH",
+                "path_id": "retained",
+                "resolved_transcript_id": "retained",
+                "path_order_0based": 2,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [90],
+                "exon_ends_0based_exclusive": [310],
+                "transcript_aliases": ["retained"],
+            },
+        ]
+    )
+    tables = compile_gene_graph_tables(rows)
+    shared = tables.nodes.loc[tables.nodes["pos_0based"].eq(200), "node_type"]
+    assert set(shared) == {"acceptor", "donor"}
+    retained = tables.path_edges.loc[
+        tables.path_edges["path_id"].eq("retained")
+    ].merge(tables.edges, on="edge_id", suffixes=("_path", ""))
+    bridge = retained.loc[
+        retained["start_0based"].eq(200)
+        & retained["end_0based_exclusive"].eq(200)
+    ].iloc[0]
+    assert bridge.edge_type == "EXON_CONTINUATION"
+    assert (bridge.src_node_type, bridge.dst_node_type) == ("acceptor", "donor")
+    assert bridge.length_bp == 0
+    retained_atoms = retained.loc[retained["edge_type"].eq("RETAINED_INTRON")]
+    assert sorted(
+        retained_atoms[["start_0based", "end_0based_exclusive"]]
+        .itertuples(index=False, name=None)
+    ) == [(150, 200), (200, 250)]
+    assert tables.paths.set_index("path_id").loc["retained", "path_length_bp"] == 220
 
 
 def test_backed_prepared_dataset_loads_only_requested_gene_shard(tmp_path):

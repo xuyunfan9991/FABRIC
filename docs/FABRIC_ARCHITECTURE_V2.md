@@ -89,7 +89,7 @@ V2 的表达能力来自“细胞特异事件共同进图”和“完整路径�
 
 为最小化对现有数据层的修改，模型 token 继续使用 processing edge。局部 `local_edge_index` 的定义完全沿用当前 `graph.py`：若两条 processing edges 在至少一条冻结的 matrix isoform path 上前后连续，则建立双向、去重的 line-graph adjacency；除此之外不额外连接所有“共享 processing site”但未在合法路径上连续的 edge pairs。非相邻的全基因关系由 GraphGPS 的 global attention 表达。V2 不把每条 transcript 单独建图，也不把 alternative 重新定义成第二张可学习图的节点。
 
-一个 retained exon 若覆盖多个彼此重叠或相接的 annotated introns，不能把该 component 的最小 start 与最大 end 合成为一条虚构的 `RETAINED_INTRON` edge；这会删除内部 processing sites 并产生 annotation 中不存在的端点配对。第一版在这种未冻结结构表达的 component 上明确失败，待逐 path 的 atomic/composite semantics 单独冻结后再纳入，不得静默合并。
+一个 retained exon 若覆盖多个彼此重叠或相接的 annotated introns，不能把该 component 的最小 start 与最大 end 合成为一条虚构的 `RETAINED_INTRON` edge；这会删除内部 processing sites 并产生 annotation 中不存在的端点配对。冻结实现必须保留该 exon 内每个 annotated donor/acceptor boundary，并按全部边界将 exon 切成逐 path 的正跨度 atomic segments；一个 atomic segment 当且仅当完全位于至少一个被该 exon 覆盖的 annotated intron 内时标记为 `RETAINED_INTRON`，其余正跨度 segments 为 `EXON_CONTINUATION`。若两个 introns 在同一坐标相接，则 retained path 同时保留该坐标的 acceptor 与 donor identity，并按 transcript order 以一条唯一允许的零跨度 `acceptor -> donor` `EXON_CONTINUATION` bridge 连接；该 bridge 的 `span_bp=length_bp=0`，不生成 edge-interval motif region，也不增加 path length。除此以外任何相同坐标的 path transition 均非法。该规则不增加、删除或复制 frozen ONT structural paths，只把每条 path 忠实展开为 annotation-backed atomic processing transitions。
 
 ### 3.2 ONT-matrix isoform paths
 

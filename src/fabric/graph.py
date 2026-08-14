@@ -454,12 +454,24 @@ def build_gene_graph(
         )
         direction = np.diff(path_positions)
         strand = str(path["strand"])
-        if (strand == "+" and not bool((direction > 0).all())) or (
-            strand == "-" and not bool((direction < 0).all())
+        if (strand == "+" and bool((direction < 0).any())) or (
+            strand == "-" and bool((direction > 0).any())
         ):
             raise ValueError(
                 f"path {path_id} node order disagrees with transcript strand"
             )
+        coincident = np.flatnonzero(direction == 0)
+        for index in coincident:
+            edge = selected_edges.iloc[int(index)]
+            if (
+                str(edge.edge_type) != "EXON_CONTINUATION"
+                or int(edge.span_bp) != 0
+                or (str(edge.src_node_type), str(edge.dst_node_type))
+                != ("acceptor", "donor")
+            ):
+                raise ValueError(
+                    f"path {path_id} has an invalid coincident-site transition"
+                )
         path_edge_rows.append(indices)
         path_node_rows.append(node_sequence)
         incidence_row.extend([path_row] * len(indices))

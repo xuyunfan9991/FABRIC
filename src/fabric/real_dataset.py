@@ -346,7 +346,7 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
     for row, starts, ends in models:
         ordered_nodes: list[tuple[int, str]] = []
         junction_after: set[int] = set()
-        retained_pairs: set[tuple[int, int]] = set()
+        retained_segments: set[tuple[int, int]] = set()
         for exon_index, (start, end) in enumerate(zip(starts, ends)):
             boundaries: set[int] = {start, end}
             internal_types: dict[int, set[str]] = {}
@@ -356,33 +356,20 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
                 if start < min(donor, acceptor)
                 and max(donor, acceptor) < end
             )
-            overlap_component: list[tuple[int, int]] = []
-            component_end = -1
-            for low, high in retained_intervals:
-                if overlap_component and low <= component_end:
-                    overlap_component.append((low, high))
-                    component_end = max(component_end, high)
-                else:
-                    if len(overlap_component) > 1:
-                        raise ValueError(
-                            "retained exon covers an unresolved overlapping-intron "
-                            f"component for {gene_id}/{row.path_id}: "
-                            f"exon=({start}, {end}), introns={overlap_component}"
-                        )
-                    overlap_component = [(low, high)]
-                    component_end = high
-            if len(overlap_component) > 1:
-                raise ValueError(
-                    "retained exon covers an unresolved overlapping-intron "
-                    f"component for {gene_id}/{row.path_id}: "
-                    f"exon=({start}, {end}), introns={overlap_component}"
-                )
             for low, high in retained_intervals:
                 donor, acceptor = (low, high) if strand == "+" else (high, low)
-                retained_pairs.add((donor, acceptor))
                 boundaries.update((donor, acceptor))
                 internal_types.setdefault(donor, set()).add("donor")
                 internal_types.setdefault(acceptor, set()).add("acceptor")
+            genomic_boundaries = sorted(boundaries)
+            retained_segments.update(
+                (left, right)
+                for left, right in zip(genomic_boundaries[:-1], genomic_boundaries[1:])
+                if any(
+                    intron_start <= left and right <= intron_end
+                    for intron_start, intron_end in retained_intervals
+                )
+            )
             transcript_order = sorted(boundaries, reverse=strand == "-")
             for position in transcript_order:
                 endpoint_type = _node_type_for_position(
@@ -396,21 +383,31 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
                 # donor/acceptor type, not the enclosing exon endpoint type.
                 if position not in {start, end}:
                     candidate_types = internal_types.get(position, set())
-                    if len(candidate_types) != 1:
+                    if not candidate_types or candidate_types - {"donor", "acceptor"}:
                         raise ValueError(
-                            f"ambiguous internal processing-site type at {gene_id}:{position}"
+                            f"invalid internal processing-site type at {gene_id}:{position}"
                         )
-                    endpoint_type = next(iter(candidate_types))
+                    # A retained exon can span two annotated introns that meet
+                    # at one genomic coordinate.  Keep both processing-site
+                    # identities in transcript order; the zero-span bridge
+                    # between them is assigned below.
+                    for candidate_type in sorted(
+                        candidate_types,
+                        key={"acceptor": 0, "donor": 1}.__getitem__,
+                    ):
+                        node_types.setdefault(position, set()).add(candidate_type)
+                        ordered_nodes.append((position, candidate_type))
+                    continue
                 node_types.setdefault(position, set()).add(endpoint_type)
                 ordered_nodes.append((position, endpoint_type))
             if exon_index < len(starts) - 1:
                 junction_after.add(len(ordered_nodes) - 1)
         edge_types = []
         for index, (left, right) in enumerate(zip(ordered_nodes[:-1], ordered_nodes[1:])):
-            pair = (left[0], right[0])
+            pair = tuple(sorted((left[0], right[0])))
             if index in junction_after:
                 edge_types.append("SPLICE")
-            elif pair in retained_pairs:
+            elif left[0] != right[0] and pair in retained_segments:
                 edge_types.append("RETAINED_INTRON")
             else:
                 edge_types.append("EXON_CONTINUATION")
@@ -422,7 +419,8 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
     span = gene_end - gene_start
     # The same genomic boundary can legitimately be a TSS in one path and a
     # donor in another.  Node identity is therefore (position, processing
-    # type), while a path still has strictly monotone genomic positions.
+    # type). Paths are monotone in genomic position; equality is reserved for
+    # the acceptor-to-donor bridge at one shared intron boundary.
     node_id = {
         (position, node_type): f"node:{gene_id}:{node_type}:{chrom}:{position}:{strand}"
         for position, types in node_types.items()
