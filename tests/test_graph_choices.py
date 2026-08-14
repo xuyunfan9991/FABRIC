@@ -2,200 +2,214 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
+import torch
 
-from fabric.choices import choice_identifiability, extract_elementary_choices
-from fabric.graph import (
-    GeneGraph,
-    normalize_compatibility_path_order,
-    validate_compatibility_rows,
+from fabric.choices import (
+    SUPPORT_TIER_DIRECT,
+    aggregate_group_log_probabilities,
+    aggregate_group_probabilities,
+    alternative_coverage_tables,
+    alternative_relative_log_mass,
+    build_alternative_reporting_index,
+    build_path_identifiability_index,
+    centered_logit_change,
+    classify_heldout_alternative_support,
+    classify_heldout_path_support,
 )
+from fabric.graph import build_gene_graph
 
 
-def _choice_only_graph(
-    gene_id: str, alternatives: tuple[tuple[str, ...], ...]
-) -> GeneGraph:
-    """Build a minimal graph whose legal paths are the supplied node sequences."""
+def _ec(graph, rows):
+    return pd.DataFrame(
+        [
+            {
+                "cell_id": cell,
+                "gene_id": graph.gene_id,
+                "compatible_path_ids": paths,
+                "compatible_path_count": len(paths),
+                "molecule_count": mass,
+                "split": split,
+            }
+            for cell, paths, mass, split in rows
+        ]
+    )
 
-    node_ids = tuple(dict.fromkeys(node for path in alternatives for node in path))
-    node_types: dict[str, str] = {}
-    for path in alternatives:
-        for position, node_id in enumerate(path):
-            node_type = "donor" if position % 2 == 0 else "acceptor"
-            previous = node_types.setdefault(node_id, node_type)
-            assert previous == node_type
-    nodes = pd.DataFrame(
-        {
-            "node_id": node_ids,
-            "node_type": [node_types[node_id] for node_id in node_ids],
-        }
-    )
-    edge_pairs = tuple(
-        dict.fromkeys(
-            (left, right)
-            for path in alternatives
-            for left, right in zip(path[:-1], path[1:], strict=True)
-        )
-    )
-    edge_ids = tuple(f"edge:{left}->{right}" for left, right in edge_pairs)
-    edge_index = {pair: index for index, pair in enumerate(edge_pairs)}
-    edges = pd.DataFrame(
-        {
-            "edge_id": edge_ids,
-            "src_node_id": [left for left, _ in edge_pairs],
-            "dst_node_id": [right for _, right in edge_pairs],
-        }
-    )
-    path_edge_rows = tuple(
-        tuple(edge_index[pair] for pair in zip(path[:-1], path[1:], strict=True))
-        for path in alternatives
-    )
-    incidence_rows = [
-        path_index
-        for path_index, edge_row in enumerate(path_edge_rows)
-        for _ in edge_row
-    ]
-    incidence_columns = [edge for edge_row in path_edge_rows for edge in edge_row]
-    incidence = sparse.csr_matrix(
-        (
-            np.ones(len(incidence_rows), dtype=np.float32),
-            (incidence_rows, incidence_columns),
-        ),
-        shape=(len(alternatives), len(edge_ids)),
-    )
-    return GeneGraph(
-        gene_id=gene_id,
+
+def _single_path_graph(graph):
+    path_id = graph.path_ids[0]
+    path_edges = graph.path_edges.loc[graph.path_edges["path_id"].astype(str).eq(path_id)]
+    edge_ids = set(path_edges["edge_id"].astype(str))
+    edges = graph.edges.loc[graph.edges["edge_id"].astype(str).isin(edge_ids)]
+    node_ids = set(edges["src_node_id"].astype(str)) | set(edges["dst_node_id"].astype(str))
+    nodes = graph.nodes.loc[graph.nodes["node_id"].astype(str).isin(node_ids)]
+    paths = graph.paths.loc[graph.paths["path_id"].astype(str).eq(path_id)]
+    return build_gene_graph(
+        graph.gene_id,
         nodes=nodes,
         edges=edges,
-        paths=pd.DataFrame(),
-        path_edges=pd.DataFrame(),
-        edge_ids=edge_ids,
-        path_ids=tuple(f"path:{index}" for index in range(len(alternatives))),
-        path_edge_rows=path_edge_rows,
-        path_node_rows=alternatives,
-        path_edge_incidence=incidence,
-        local_edge_index=np.empty((2, 0), dtype=np.int64),
-        edge_features=np.empty((len(edge_ids), 0), dtype=np.float32),
+        paths=paths,
+        path_edges=path_edges,
     )
 
 
-def test_elementary_choice_and_incidence_are_exact(toy_gene_graph):
-    catalog = extract_elementary_choices(toy_gene_graph)
-    assert len(catalog.choices) == 1
-    choice = catalog.choices[0]
-    assert choice.scope == "internal"
-    assert len(choice.alternatives) == 2
-    assert choice.path_to_alternative == (0, 1)
-    np.testing.assert_array_equal(catalog.path_choice_incidence.toarray(), np.eye(2))
-
-
-def test_unequal_length_exon_skipping_alternatives_share_one_exit():
-    graph = _choice_only_graph(
-        "ENSG_UNEQUAL",
-        (
-            ("entry", "included_acceptor", "included_donor", "exit"),
-            ("entry", "exit"),
-        ),
-    )
-    catalog = extract_elementary_choices(graph)
-
-    assert len(catalog.choices) == 1
-    choice = catalog.choices[0]
-    assert (choice.entry_node_id, choice.exit_node_id) == ("entry", "exit")
-    assert sorted(len(alternative.edge_ids) for alternative in choice.alternatives) == [
-        1,
-        3,
-    ]
-    assert sorted(choice.path_to_alternative) == [0, 1]
-
-
-def test_staggered_arrival_multiway_alternatives_form_one_k4_choice():
-    graph = _choice_only_graph(
-        "ENSG_STAGGERED_K4",
-        (
-            ("entry", "long_1", "long_2", "long_3", "exit"),
-            ("entry", "short_a", "exit"),
-            ("entry", "short_b", "exit"),
-            ("entry", "short_c", "exit"),
-        ),
-    )
-    catalog = extract_elementary_choices(graph)
-
-    assert len(catalog.choices) == 1
-    choice = catalog.choices[0]
-    assert len(choice.alternatives) == 4
-    assert sorted(len(alternative.edge_ids) for alternative in choice.alternatives) == [
-        2,
-        2,
-        2,
-        4,
-    ]
-    assert sorted(choice.path_to_alternative) == [0, 1, 2, 3]
-
-
-def test_structure_and_train_supervision_have_k_minus_one_rank(toy_gene_graph):
-    catalog = extract_elementary_choices(toy_gene_graph)
-    rows = pd.DataFrame(
-        {
-            "cell_id": ["c0", "c1", "c2"],
-            "gene_id": [toy_gene_graph.gene_id] * 3,
-            "compatible_path_ids": [["p0"], ["p1"], ["p0", "p1"]],
-            "compatible_path_count": [1, 1, 2],
-            "molecule_count": [3, 4, 20],
-            "split": ["train", "train", "train"],
-        }
-    )
-    audit = choice_identifiability(
-        catalog,
-        rows,
-        rank_tolerance=1e-8,
-        minimum_informative_molecule_mass=5,
-        minimum_alternative_support=3,
-    )
-    assert audit.loc[0, "structural_rank"] == 1
-    assert audit.loc[0, "supervision_rank"] == 1
-    assert audit.loc[0, "informative_molecule_mass"] == 7
-    # Each singleton EC informs both sides of the zero-sum binary contrast.
-    assert audit.loc[0, "alternative_support"] == [7.0, 7.0]
-    assert bool(audit.loc[0, "eligible"])
-
-
-def test_choice_without_train_ec_is_explicitly_supervision_ineligible(
+def test_train_patterns_define_observational_groups_and_duplicate_rows_only_add_mass(
     toy_gene_graph,
 ):
-    catalog = extract_elementary_choices(toy_gene_graph)
-    empty_ec = pd.DataFrame(columns=["split", "molecule_count"])
-    audit = choice_identifiability(
-        catalog,
-        empty_ec,
-        rank_tolerance=1e-8,
-        minimum_informative_molecule_mass=1,
-        minimum_alternative_support=1,
+    rows = _ec(
+        toy_gene_graph,
+        [
+            ("t0", ["p0"], 2, "train"),
+            ("t1", ["p0"], 3, "train"),
+            ("t2", ["p1"], 7, "train"),
+            ("t3", ["p0", "p1"], 99, "train"),
+            ("v0", ["p0"], 1000, "val"),
+        ],
     )
+    index = build_path_identifiability_index(toy_gene_graph, rows)
 
-    assert audit.loc[0, "structural_rank"] == 1
-    assert audit.loc[0, "supervision_rank"] == 0
-    assert audit.loc[0, "informative_ec_count"] == 0
-    assert audit.loc[0, "informative_molecule_mass"] == 0
-    assert audit.loc[0, "alternative_support"] == [0.0, 0.0]
-    assert not bool(audit.loc[0, "eligible"])
+    gene = index.genes.iloc[0]
+    assert gene["train_compatibility_matrix"] == [[1, 0], [0, 1]]
+    assert gene["augmented_rank"] == gene["group_count"] == 2
+    assert bool(gene["cohort_contrast_separable"])
+    assert len(index.train_patterns) == 2
+    assert sorted(index.train_patterns["molecule_mass"]) == [5.0, 7.0]
+    assert sorted(index.groups["train_exclusive_molecule_mass"]) == [5.0, 7.0]
 
 
-def test_external_ec_path_list_is_explicitly_reordered_to_path_table_axis(
+def test_identical_train_columns_form_one_group_and_split_group_row_cannot_upgrade_cell(
     toy_gene_graph,
 ):
-    rows = pd.DataFrame(
-        {
-            "cell_id": ["c0"],
-            "gene_id": [toy_gene_graph.gene_id],
-            "compatible_path_ids": [["p1", "p0"]],
-            "compatible_path_count": [2],
-            "molecule_count": [1],
-            "split": ["train"],
-        }
+    graph = toy_gene_graph
+    # No informative train row distinguishes p0 from p1, so they form one group.
+    train = _ec(graph, [("t0", ["p0", "p1"], 5, "train")])
+    index = build_path_identifiability_index(graph, train)
+    assert index.genes.iloc[0]["group_count"] == 1
+    assert index.groups.iloc[0]["member_path_ids"] == ["p0", "p1"]
+
+    heldout = _ec(graph, [("v0", ["p0"], 9, "val")])
+    cells, classified = classify_heldout_path_support(index, heldout)
+    assert bool(classified.iloc[0]["novel_split_group_row"])
+    assert not bool(classified.iloc[0]["group_constant"])
+    # The only train row was all-path and therefore audit-only: there is no
+    # train exclusive support from which to claim cohort identifiability.
+    assert cells.iloc[0]["support_tier"] == "supervision_unidentifiable_prediction"
+    assert not bool(cells.iloc[0]["direct_cell_supported"])
+
+    reporting = build_alternative_reporting_index(graph, index)
+    assert not reporting.contrasts["cohort_reportable"].any()
+    assert reporting.contrasts["crossing_observational_group_ids"].map(bool).all()
+
+
+def test_heldout_direct_support_group_sums_and_reporting_coverage(toy_gene_graph):
+    train = _ec(
+        toy_gene_graph,
+        [("t0", ["p0"], 3, "train"), ("t1", ["p1"], 4, "train")],
     )
-    normalized = normalize_compatibility_path_order(rows, toy_gene_graph)
-    assert normalized.loc[0, "source_compatible_path_ids"] == ["p1", "p0"]
-    assert normalized.loc[0, "compatible_path_ids"] == ["p0", "p1"]
-    assert normalized.loc[0, "compatible_path_indices"] == [0, 1]
-    validate_compatibility_rows(normalized, toy_gene_graph)
+    index = build_path_identifiability_index(toy_gene_graph, train)
+    heldout = _ec(
+        toy_gene_graph,
+        [("v0", ["p0"], 2, "val"), ("v0", ["p1"], 5, "val")],
+    )
+    cells, _ = classify_heldout_path_support(index, heldout)
+    assert cells.iloc[0]["support_tier"] == SUPPORT_TIER_DIRECT
+    assert cells.iloc[0]["group_exclusive_molecule_mass"] == [2.0, 5.0]
+
+    probabilities = torch.tensor([[0.2, 0.8]])
+    torch.testing.assert_close(
+        aggregate_group_probabilities(probabilities, index, toy_gene_graph.gene_id),
+        probabilities,
+    )
+    torch.testing.assert_close(
+        aggregate_group_log_probabilities(probabilities.log(), index, toy_gene_graph.gene_id).exp(),
+        probabilities,
+    )
+
+    reporting = build_alternative_reporting_index(toy_gene_graph, index)
+    assert reporting.choices["choice_kind"].tolist() == ["internal"]
+    assert reporting.choices.iloc[0]["n_matched_context_candidates"] == 1
+    support = classify_heldout_alternative_support(reporting, index, heldout)
+    assert support["direct_cell_supported"].all()
+    manifest = support.loc[
+        support["contrast_kind"].eq("matched_context"),
+        ["cell_id", "gene_id", "contrast_id"],
+    ]
+    coverage = alternative_coverage_tables(
+        reporting, support, manifest_selected=manifest
+    )
+    final_choice = coverage["choice_level"].query(
+        "choice_scope == 'internal' and waterfall_level == "
+        "'has_direct_and_manifest_selected_heldout_record'"
+    )
+    assert final_choice.iloc[0]["choice_fraction"] == 1.0
+    final_record = coverage["record_level"].query(
+        "choice_scope == 'internal' and waterfall_level == "
+        "'direct_and_manifest_selected'"
+    )
+    validation_record = final_record.query("split == 'val'").iloc[0]
+    assert validation_record["record_denominator"] == 1
+    assert validation_record["record_fraction"] == 1.0
+    test_record = final_record.query("split == 'test'").iloc[0]
+    assert test_record["record_denominator"] == 0
+    assert test_record["status"] == "not_estimable"
+    assert np.isnan(test_record["record_fraction"])
+
+
+def test_marginal_and_matched_log_mass_are_independently_gauge_invariant(
+    toy_gene_graph,
+):
+    index = build_path_identifiability_index(
+        toy_gene_graph,
+        _ec(
+            toy_gene_graph,
+            [("t0", ["p0"], 1, "train"), ("t1", ["p1"], 1, "train")],
+        ),
+    )
+    reporting = build_alternative_reporting_index(toy_gene_graph, index)
+    for contrast in reporting.contrasts.itertuples(index=False):
+        full = torch.tensor([[1.5, -0.25]])
+        counterfactual = torch.tensor([[0.2, 0.4]])
+        full_rho = alternative_relative_log_mass(
+            full,
+            toy_gene_graph.path_ids,
+            contrast.numerator_path_ids,
+            contrast.denominator_path_ids,
+        )
+        shifted_full_rho = alternative_relative_log_mass(
+            full + 100.0,
+            toy_gene_graph.path_ids,
+            contrast.numerator_path_ids,
+            contrast.denominator_path_ids,
+        )
+        counter_rho = alternative_relative_log_mass(
+            counterfactual,
+            toy_gene_graph.path_ids,
+            contrast.numerator_path_ids,
+            contrast.denominator_path_ids,
+        )
+        shifted_counter_rho = alternative_relative_log_mass(
+            counterfactual - 30.0,
+            toy_gene_graph.path_ids,
+            contrast.numerator_path_ids,
+            contrast.denominator_path_ids,
+        )
+        torch.testing.assert_close(full_rho, shifted_full_rho)
+        torch.testing.assert_close(counter_rho, shifted_counter_rho)
+    centered = centered_logit_change(
+        np.array([[2.0, 1.0]]), np.array([[0.0, 0.0]])
+    )
+    np.testing.assert_allclose(centered, [[0.5, -0.5]])
+
+
+def test_single_path_catalog_has_stable_empty_reporting_schemas(toy_gene_graph):
+    graph = _single_path_graph(toy_gene_graph)
+    index = build_path_identifiability_index(
+        graph,
+        _ec(graph, [("t0", list(graph.path_ids), 3, "train")]),
+    )
+    reporting = build_alternative_reporting_index(graph, index)
+    assert reporting.choices.empty
+    assert reporting.alternatives.empty
+    assert reporting.path_membership.empty
+    assert reporting.contrasts.empty
+    assert "choice_id" in reporting.choices
+    assert "contrast_id" in reporting.contrasts

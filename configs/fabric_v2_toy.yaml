@@ -1,0 +1,74 @@
+contract: FABRIC_ARCHITECTURE_V2
+status: TOY_IMPLEMENTATION_VALIDATION_ONLY
+execution:
+  scope: toy
+  training_authorized: true
+  final_test_authorized: false
+
+inputs:
+  frozen: true
+  compatible_ec_scope: toy_fixture
+  test_exposure: synthetic
+
+model:
+  dynamic_projection_dim: 8
+  hidden_dim: 16
+  attention_heads: 2
+  graphgps_layers: 1
+  path_hidden_dim: 12
+
+optimizer:
+  family: AdamW
+  learning_rate: 0.01
+  lr_scheduler:
+    name: constant
+  gradient_clip_norm: 0.0
+  lambda_base: 0.001
+  lambda_int: 0.01
+  selection_conditions: [cis_dna, cis_rna, full]
+  tuning_seeds: [11, 13, 17]
+  selection_status: PREDECLARED_IMPLEMENTATION
+  selected_pair: [0.001, 0.01]
+  aggregate_validation_nll: null
+  grid:
+    - [0.0, 0.001]
+    - [0.001, 0.01]
+
+training:
+  max_epochs: 3
+  early_stopping_patience: 3
+  primary_epoch_unit: sampled_informative_gene_cell_horvitz_thompson
+  max_train_gene_cells_per_gene_per_epoch: 512
+  resample_train_gene_cells_each_epoch: true
+  selected_gene_cell_ec_rows: all_informative_rows
+  sampling_estimator: horvitz_thompson_full_train_molecule_total
+  optimizer_step_unit: train_positive_gene
+  gene_microbatch_gradient_accumulation: true
+  high_dtu_sensitivity:
+    enabled: false
+    primary_objective: false
+
+monitor:
+  enabled: false
+  timing: once_after_each_completed_epoch
+  selection_eligible: false
+  sealed: true
+  metric: ont_matrix_kl_count_weighted
+  scope_policy: likelihood_informative_validation_cell_gene_with_at_least_two_positive_ont_paths
+  target_root: null
+
+resources:
+  frozen: true
+  evidence_class: toy_local_profile
+  batch_policy: gene_shape_adaptive_v1
+  compute_precision: float32_highest
+  prefetch_backed_gene_shards: false
+  target_gpu_allocated_bytes: 67108864
+  unmodeled_gpu_reserve_bytes: 1048576
+  max_cells_per_gpu_batch: 32768
+  train_bytes_per_shape_element: 12.0
+  evaluation_bytes_per_shape_element: 4.0
+  batching_probability_tolerance: 1.0e-6
+
+deferred_cis_extension:
+  enabled: false

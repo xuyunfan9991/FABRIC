@@ -1,0 +1,131 @@
+contract: FABRIC_ARCHITECTURE_V2
+status: COMPATIBILITY_COMPLETE_OBSERVATION_PROCESS_CROSS_PIPELINE_RECONCILED
+
+output_dir: /home2/xyf/project/FABRIC/data/processed/fabric_v2_compatible_ec_v1
+
+inputs:
+  selection_dir: /home2/xyf/project/FABRIC/data/processed/fabric_ont_gene_selection_v3
+  bam: /home2/xyf/project/PRISM/data/new_bam/20260125_merged.filtered.annotated_final_withTX.bam
+  bam_index: /home2/xyf/project/PRISM/data/new_bam/20260125_merged.filtered.annotated_final_withTX.bam.bai
+  reference_fasta: /home2/xyf/project/PRISM/data/reference/genome.fa
+  reference_fai: /home2/xyf/project/PRISM/data/reference/genome.fa.fai
+  authoritative_gtf: /home2/xyf/project/PRISM/data/new_bam/gtf/20260110_OUT.transcript_models_reid.sorted.gtf
+  matrix_matched_gtf: /home2/xyf/project/PRISM/data/gtf/transcripts_filtered.gtf
+  ont_transcript_matrix: /home2/xyf/project/PRISM/data/matrix/tx_matrix_ONT/tx_matrix_ONT.mtx
+  ont_transcripts: /home2/xyf/project/PRISM/data/matrix/tx_matrix_ONT/transcripts.tsv
+  ont_barcodes: /home2/xyf/project/PRISM/data/matrix/tx_matrix_ONT/barcodes.tsv
+
+# These rules apply identically to train and validation. TX is used only for
+# authoritative gene assignment and never to choose a compatible path.
+compatibility_policy_id: fabric_v2_compatible_ec_policy_v1_20260813
+compatibility_policy:
+  minimum_mapq: 20
+  minimum_junction_anchor_bp: 8
+  maximum_deletion_bp: 20
+  junction_tolerance_bp: 6
+  terminal_tolerance_bp: 6
+  ir_minimum_exon_aligned_bp_each_side: 8
+  ir_minimum_intron_aligned_bp_each_side: 8
+  require_primary: true
+  reject_sa_tag: true
+  library_strand_protocol: forward
+
+# Exact empirical XE/TS ownership of the frozen matrix prefixes. Every frozen
+# matrix prefix must have one and only one owner.
+library_to_matrix_prefix:
+  emb1:
+    250414_01_HT: Emb01_head_uppertrunk
+    250414_01_VT: Emb01_viscera_lowertrunk
+  emb2:
+    241218_01_HT: Emb02_head_uppertrunk
+    241218_01_VT: Emb02_viscera_lowertrunk
+  emb3:
+    250411_01_HT: Emb03_viscera_lowertrunk
+    250411_01_VT: Emb03_head_uppertrunk
+  emb4:
+    250117_01_Head: Emb04_head
+    250117_01_Trunk: Emb04_trunk
+    250117_01_VL: Emb04_viscera_limb
+  emb5:
+    l21: Emb05_limb
+    t21: Emb05_trunk
+    v21: Emb05_viscera
+  emb6:
+    h22: Emb06_head
+    l22: Emb06_limb
+    t22: Emb06_trunk
+    v22: Emb06_viscera
+  emb7:
+    250206_01_Head: Emb07_head
+    250206_01_Trunk: Emb07_trunk
+    250206_01_VL: Emb07_viscera_limb
+  emb8:
+    241220_01_Head: Emb08_whole_1
+    241220_01_Trunk: Emb08_whole_2
+    241220_01_VL: Emb08_whole_3
+  emb9:
+    250530_01_Head: Emb09_head
+    250530_01_Trunk: Emb09_trunk
+    250530_01_VL: Emb09_viscera_limb
+
+upstream_alignment_and_molecule_provenance_audit:
+  alignment_table_status: FOUND_INDEXED_BAM
+  samtools_quickcheck: PASS
+  bam_header_sort_order: coordinate
+  bam_reference_contig_count: 194
+  bam_idxstats_total_records: 326978516
+  aligner_identity_from_bam_header: minimap2_2.24-r1122_and_2.28-r1209
+  aligner_command_from_bam_header: minimap2_-ax_splice_-t_50_-k14_--secondary=no
+  upstream_reference_path_recorded_in_header: /home/gf/data/sqanti3/genome.fa
+  upstream_reference_path_current_host_status: MISSING
+  upstream_matched_fastq_roots_recorded_in_header:
+    - /home/gf/data/gf-pipline/ont
+    - /home4/gf/data/gf-pipeline/ont
+  upstream_matched_fastq_roots_current_host_status: MISSING
+  current_reference_identity_match_to_bam_contigs: PASS_194_CONTIGS_EXACT_LENGTH
+  authoritative_gtf_transcript_count: 198785
+  matrix_matched_gtf_transcript_count: 101067
+  barcode_source: read_name_first_16bp
+  umi_source: read_name_following_12bp
+  barcode_umi_assignment_software: BLAZE_v2.5.1
+  barcode_umi_assignment_command: blaze_--threads=100_--expect-cell=30000
+  blaze_source_modification_scope: USER_CONFIRMED_DEFAULT_ONLY_RETAIN_POLYA_NO_BARCODE_UMI_ASSIGNMENT_CHANGE
+  sampled_read_name_parse_rate: 1.0
+  sampled_required_tag_presence_rate: 1.0
+  absent_standard_cell_umi_tags: [CB, CR, UB, UR]
+  bam_transcript_tag: TX
+  bam_transcript_tag_use_in_v2: gene_assignment_only
+  internal_priming_qc_provenance: NOT_PERFORMED_USER_CONFIRMED_DEFAULT
+  genomic_dna_contamination_qc_provenance: NOT_PERFORMED_USER_CONFIRMED_DEFAULT
+  protocol_mature_transcript_qc_provenance: NOT_PERFORMED_USER_CONFIRMED_DEFAULT
+
+matrix_quantifier_provenance:
+  software_identity: BLAZE_v2.5.1_minimap2_v2.24_IsoQuant_v3.6.2
+  config_identity:
+    blaze: blaze --threads=100 --expect-cell=30000
+    minimap2: minimap2 -ax splice -t 50 -k14 --secondary=no
+    isoquant_gene_assignment: isoquant.py -t 100 --data_type nanopore --no_model_construction
+    isoquant_transcript_workflow: per_sample_discovery_clean_merge_consensus_second_round_discovery
+  reference_gtf_identity: GRCh38_Gencode_v32_plus_cross_sample_consensus_transcripts
+  barcode_extraction_policy_identity: BLAZE_v2.5.1_cell_barcode_and_UMI_assignment
+  blaze_source_modification_scope: USER_CONFIRMED_DEFAULT_ONLY_RETAIN_POLYA_NO_BARCODE_UMI_ASSIGNMENT_CHANGE
+  umi_read_collapse_policy_identity: identical_cell_barcode_and_UMI_reads_deduplicated_as_PCR_duplicates
+  multi_mapping_policy_identity: unmapped_and_multi_transcript_reads_removed_multi_locus_within_same_gene_retained_for_gene_quantification
+  hard_assignment_count_semantics: one_integer_transcript_matrix_count_is_one_retained_unique_cell_barcode_UMI_after_transcript_ambiguity_filtering
+  transcript_retention_policy: transcript_UMI_ge5_and_parent_gene_UMI_ge10
+  provenance_source: /home2/xyf/project/FABRIC/paper/Single-cell long-read manu_0403.docx
+  provenance_sections:
+    - Pre-processing of long-read scRNA-seq data
+    - Gene expression quantification in long-read single-cell RNA-seq
+    - Transcript annotation and quantification in long-read single-cell RNA-seq
+
+observation_process:
+  comparison_name: same_library_cross_pipeline_ont_matrix_agreement
+  compatible_test_row_exposure: not_materialized_before_checkpoint
+  matrix_test_count_exposure: previously_materialized_held_out_test
+  test_predictions_or_metrics_computed: false
+  matrix_count_semantics_verified_same_population: false
+  same_population_reason: transcript_matrix_removes_multi_transcript_reads_while_compatible_EC_retains_ambiguous_reads_as_compatible_sets
+  matrix_cell_gene_reconciliation: CROSS_PIPELINE_RECONCILED
+
+minimum_external_delivery_required: {}

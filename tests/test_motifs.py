@@ -2,262 +2,282 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from fabric.choices import extract_elementary_choices
 from fabric.motifs import (
-    PWM,
-    build_dna_peak_regions,
+    EVENT_ROUTE_COLUMNS,
+    PHYSICAL_EVENT_COLUMNS,
+    _cap_route_decisions,
+    build_candidate_routes,
     build_factor_catalog,
-    cap_motif_events,
-    fixed_event_feature_matrix,
-    scan_motif_regions,
+    build_route_burden,
+    collapse_physical_events,
 )
 
 
-def test_factor_identity_unifies_modalities_and_excludes_ambiguous(tmp_path):
-    jaspar = tmp_path / "jaspar.tsv"
-    jaspar.write_text("motif_id\ttf_name\nMA1\tFOO\nMA2\tFOO::BAR\n")
-    cisbp = tmp_path / "cisbp.tsv"
-    cisbp.write_text("motif_id\trbp_gene\tgene_id\nR1\tFOO\tENSG_FOO\n")
-    result = build_factor_catalog(
-        jaspar,
-        cisbp,
-        gene_symbol_to_id={"FOO": "ENSG_FOO", "BAR": "ENSG_BAR"},
-    )
-    assert len(result.factors) == 1
-    factor = result.factors.iloc[0]
-    assert factor.activity_gene_id == "ENSG_FOO"
-    assert factor.dna_motif_ids == ["MA1"]
-    assert factor.rna_motif_ids == ["R1"]
-    assert result.excluded_motifs.iloc[0].motif_id == "MA2"
-
-
-def test_motif_candidates_are_static_and_cap_uses_only_static_fields():
-    pwm = PWM(
-        motif_id="M1",
-        name="factor",
-        probabilities=np.array(
-            [[0.97, 0.01, 0.01, 0.01], [0.01, 0.97, 0.01, 0.01]], dtype=float
-        ),
-    )
-    regions = pd.DataFrame(
-        {
-            "gene_id": ["g", "g"],
-            "choice_id": ["c", "c"],
-            "alternative_id": ["a0", "a1"],
-            "chrom": ["chr1", "chr1"],
-            "start_0based": [100, 100],
-            "end_0based": [106, 106],
-            "strand": ["+", "+"],
-            "anchor_0based": [103, 103],
-            "region_type": ["exon", "exon"],
-            "sequence": ["ACACAC", "ACACAC"],
-        }
-    )
-    mapping = pd.DataFrame(
-        {
-            "modality": ["RNA"],
-            "motif_id": ["M1"],
-            "factor_id": ["f"],
-            "factor_group_id": ["f"],
-        }
-    )
-    events = scan_motif_regions(
-        regions,
-        {"M1": pwm},
-        mapping,
-        modality="RNA",
-        minimum_relative_score=0.95,
-    )
-    assert all(value == ["a0", "a1"] for value in events.relation_alternative_ids)
-    selected, audit = cap_motif_events(events, events_per_choice_cap=2)
-    assert len(selected) == 2
-    assert bool(audit.loc[0, "cap_saturated"])
-
-
-def test_shared_choice_boundary_peak_relates_to_every_alternative(toy_gene_graph):
-    class AReference:
-        def fetch(self, chrom, start, end, strand="+"):
-            return "A" * (end - start)
-
-    catalog = extract_elementary_choices(toy_gene_graph)
-    choice = catalog.choices[0]
-    positions = toy_gene_graph.nodes.set_index("node_id")["pos_0based"]
-    entry = int(positions[choice.entry_node_id])
-    peaks = pd.DataFrame(
-        {
-            "chrom": ["chr1"],
-            "start_0based": [entry - 2],
-            "end_0based": [entry + 3],
-            "peak_id": [f"chr1:{entry - 2}-{entry + 3}"],
-            "peak_support": [1.0],
-        }
-    )
-    regions = build_dna_peak_regions(
-        toy_gene_graph, catalog, peaks, AReference(), window_bp=5
-    )
-    assert set(regions["alternative_id"]) == {
-        alternative.alternative_id for alternative in choice.alternatives
+def test_factor_catalog_rejects_empty_or_duplicate_identity_members():
+    base = {
+        "modality": ["DNA"],
+        "motif_id": ["M"],
+        "factor_identity_kind": ["factor_equivalence_group"],
+        "factor_entity_id": ["group:A:B"],
+        "candidate_factor_ids": [["A", "B"]],
+        "activity_entity_id": ["group:A:B"],
+        "activity_gene_ids": [["A", "B"]],
+        "activity_proxy_rule": ["raw_sum_then_cp10k_log1p"],
     }
-    pwm = PWM("M", "factor", np.ones((2, 4), dtype=float) / 4)
-    # Give the otherwise uniform motif one discriminating A-rich position.
-    pwm = PWM("M", "factor", np.array([[0.97, 0.01, 0.01, 0.01]] * 2))
-    mapping = pd.DataFrame(
+    result = build_factor_catalog(pd.DataFrame(base), frozen_rna_gene_axis=["A", "B"])
+    assert result.factors.iloc[0].activity_gene_ids == ["A", "B"]
+    for field, invalid in (
+        ("candidate_factor_ids", [[]]),
+        ("candidate_factor_ids", [["A", "A"]]),
+        ("activity_gene_ids", [[]]),
+        ("activity_gene_ids", [["A", "A"]]),
+    ):
+        broken = pd.DataFrame(base)
+        broken[field] = invalid
+        with pytest.raises(ValueError, match="(non-empty and unique|unique and non-empty)"):
+            build_factor_catalog(broken, frozen_rna_gene_axis=["A", "B"])
+
+
+def _source_hit(**updates):
+    row = {
+        "source_hit_id": "h0",
+        "source_window_id": "w0",
+        "target_gene_id": "g",
+        "factor_entity_id": "F",
+        "factor_identity_kind": "unique",
+        "candidate_factor_ids": ["F"],
+        "activity_entity_id": "F",
+        "activity_gene_ids": ["F"],
+        "activity_proxy_rule": "unique_gene_cp10k_log1p",
+        "modality": "RNA",
+        "motif_id": "M1",
+        "motif_equivalence_family_id": "fam",
+        "chromosome": "chr1",
+        "start": 100,
+        "end": 106,
+        "strand": "+",
+        "motif_score": 0.8,
+        "calibrated_motif_quality": 0.7,
+        "source_local_rank": 1.0,
+        "source_priority": 0,
+        "orientation": "transcribed",
+        "peak_id": None,
+        "peak_support": 0.0,
+        "source_valid": True,
+    }
+    row.update(updates)
+    return row
+
+
+def test_connected_component_physical_collapse_preserves_source_provenance():
+    hits = pd.DataFrame(
+        [
+            _source_hit(source_hit_id="h0", start=100, end=108, motif_id="M1"),
+            _source_hit(source_hit_id="h1", start=106, end=114, motif_id="M2"),
+            _source_hit(source_hit_id="h2", start=112, end=120, motif_id="M3"),
+            _source_hit(
+                source_hit_id="distinct",
+                start=104,
+                end=112,
+                motif_id="M4",
+                motif_equivalence_family_id="other",
+            ),
+        ]
+    )
+    events = collapse_physical_events(
+        hits, minimum_overlap_bp=2, minimum_reciprocal_overlap=0.2
+    )
+    collapsed = events.loc[events["motif_equivalence_family_id"] == "fam"].iloc[0]
+    assert len(events) == 2
+    assert collapsed.source_motif_ids == ["M1", "M2", "M3"]
+    assert len(collapsed.source_hit_coordinates) == 3
+
+
+def _event(event_id: str, *, modality="RNA", quality=1.0, peak=0.0, cap_class="motif_anchored"):
+    row = {column: None for column in PHYSICAL_EVENT_COLUMNS}
+    row.update(
         {
-            "modality": ["DNA"],
-            "motif_id": ["M"],
-            "factor_id": ["f"],
-            "factor_group_id": ["f"],
+            "event_id": event_id,
+            "target_gene_id": "g",
+            "factor_entity_id": "F",
+            "factor_identity_kind": "unique",
+            "cap_evidence_class": cap_class,
+            "candidate_factor_ids": ["F"],
+            "activity_entity_id": "F",
+            "activity_gene_ids": ["F"],
+            "activity_proxy_rule": "unique_gene_cp10k_log1p",
+            "modality": modality,
+            "motif_id": "M",
+            "motif_equivalence_family_id": "fam",
+            "source_motif_ids": ["M"],
+            "chromosome": "chr1",
+            "start": 100,
+            "end": 105,
+            "strand": "+",
+            "source_hit_coordinates": [{"source_hit_id": event_id}],
+            "motif_score": 0.5,
+            "orientation": "transcribed" if modality == "RNA" else "same_transcript",
+            "peak_id": "p" if modality == "DNA" else None,
+            "peak_support": peak,
+            "gate_key_id": f"gate:{event_id}",
+            "source_valid": True,
+            "has_retained_route": True,
+            "gate_key_active": True,
+            "model_active": True,
+            "admission_reasons": [],
+            "calibrated_motif_quality": quality,
+            "source_local_rank": 1,
+            "source_priority": 0,
         }
     )
-    events = scan_motif_regions(
-        regions, {"M": pwm}, mapping, modality="DNA", minimum_relative_score=0.95
-    )
-    assert len(events)
-    expected = sorted(alternative.alternative_id for alternative in choice.alternatives)
-    assert all(value == expected for value in events["relation_alternative_ids"])
+    return row
 
 
-def test_negative_strand_dna_and_rna_hits_use_their_distinct_sequence_axes():
-    pwm = PWM(
-        "M",
-        "factor",
-        np.array(
-            [[0.97, 0.01, 0.01, 0.01], [0.01, 0.97, 0.01, 0.01]],
-            dtype=float,
-        ),
-    )
-    region = pd.DataFrame(
+def _route(route_id: str, event_id: str, *, anchor="a", edge="e", modality="RNA"):
+    row = {column: None for column in EVENT_ROUTE_COLUMNS}
+    row.update(
         {
-            "gene_id": ["g"],
-            "choice_id": ["c"],
-            "alternative_id": ["a"],
-            "chrom": ["chr1"],
-            "start_0based": [100],
-            "end_0based": [106],
-            "strand": ["-"],
-            "anchor_0based": [105],
-            "region_type": ["peak"],
-            # DNA interprets this as forward genomic sequence, while the RNA
-            # call interprets the same test string as transcript-oriented.
-            "sequence": ["AACAAA"],
+            "route_id": route_id,
+            "event_id": event_id,
+            "target_gene_id": "g",
+            "modality": modality,
+            "anchor_region_id": anchor,
+            "anchor_site_id": "site",
+            "edge_id": edge,
+            "route_weight": 1.0,
+            "region_type": "exon",
+            "anchor_type": "donor",
+            "transcript_oriented_side": "UPSTREAM",
+            "signed_distance_bp": 2.0,
+            "edge_relative_position": np.nan,
+            "distance_to_5prime_boundary_bp": np.nan,
+            "distance_to_3prime_boundary_bp": np.nan,
+            "geometry_kind": "site_window",
         }
     )
-    mapping = pd.DataFrame(
+    return row
+
+
+def test_calibrated_rna_cap_does_not_read_peak_support():
+    events = pd.DataFrame(
+        [_event("a", quality=1.0, peak=0), _event("b", quality=1.0, peak=999)]
+    ).set_index("event_id", drop=False)
+    routes = pd.DataFrame([_route("ra", "a"), _route("rb", "b")])
+    selected, _ = _cap_route_decisions(routes, events, 1)
+    assert selected.loc[selected["cap_selected"], "event_id"].tolist() == ["a"]
+
+
+def test_burden_counts_saturated_anchor_once_for_two_evidence_classes():
+    events = pd.DataFrame(
+        [
+            _event("motif", modality="DNA", cap_class="motif_anchored"),
+            _event("open", modality="DNA", cap_class="accessibility_only"),
+        ]
+    )
+    routes = pd.DataFrame(
+        [
+            _route("r1", "motif", modality="DNA"),
+            _route("r2", "open", modality="DNA"),
+        ]
+    )
+    candidates = routes.assign(cap_bucket_id=["bucket:motif", "bucket:open"])
+    cap_audit = pd.DataFrame(
         {
-            "modality": ["DNA", "RNA"],
-            "motif_id": ["M", "M"],
-            "factor_id": ["f", "f"],
-            "factor_group_id": ["f", "f"],
+            "cap_bucket_id": ["bucket:motif", "bucket:open"],
+            "cap_saturated": [True, True],
         }
     )
-
-    dna = scan_motif_regions(
-        region,
-        {"M": pwm},
-        mapping,
-        modality="DNA",
-        minimum_relative_score=0.95,
+    burden = build_route_burden(
+        events, routes, candidates, cap_audit, audit_population="model_input"
     )
-    rna = scan_motif_regions(
-        region.assign(region_type="exon"),
-        {"M": pwm},
-        mapping,
-        modality="RNA",
-        minimum_relative_score=0.95,
-    )
-
-    assert len(dna) == len(rna) == 1
-    assert (int(dna.iloc[0].start_0based), int(dna.iloc[0].end_0based)) == (
-        101,
-        103,
-    )
-    assert dna.iloc[0].orientation == "opposite_transcript"
-    assert float(dna.iloc[0].signed_distance_bp) == 3.0
-    assert (int(rna.iloc[0].start_0based), int(rna.iloc[0].end_0based)) == (
-        103,
-        105,
-    )
-    assert rna.iloc[0].orientation == "transcribed"
-    assert float(rna.iloc[0].signed_distance_bp) == 1.0
+    assert burden.iloc[0].saturated_anchor_group_count == 1
+    assert burden.iloc[0].saturated_cap_bucket_count == 2
 
 
-def test_event_identity_is_explicit_and_unique_across_anchors_and_regions():
-    pwm = PWM(
-        "M",
-        "factor",
-        np.array(
-            [[0.97, 0.01, 0.01, 0.01], [0.01, 0.97, 0.01, 0.01]],
-            dtype=float,
-        ),
+def test_site_route_geometry_has_strict_overlap_na_touch_and_negative_half_center():
+    events = pd.DataFrame(
+        [
+            _event("overlap"),
+            _event("touch"),
+            _event("negative"),
+        ]
     )
-    regions = pd.DataFrame(
+    events.loc[0, ["start", "end"]] = [99, 102]
+    events.loc[1, ["start", "end"]] = [98, 100]
+    events.loc[2, ["start", "end", "strand"]] = [103, 106, "-"]
+    anchors = pd.DataFrame(
         {
-            "gene_id": ["g", "g", "g"],
-            "choice_id": ["c", "c", "c"],
-            "alternative_id": ["a", "a", "a"],
-            "chrom": ["chr1", "chr1", "chr1"],
-            "start_0based": [100, 100, 100],
-            "end_0based": [102, 102, 102],
-            "strand": ["+", "+", "+"],
-            "anchor_0based": [100, 101, 100],
-            "region_type": ["exon", "exon", "intron"],
-            "sequence": ["AC", "AC", "AC"],
+            "target_gene_id": ["g", "g"],
+            "modality": ["RNA", "RNA"],
+            "anchor_region_id": ["plus", "minus"],
+            "anchor_site_id": ["s+", "s-"],
+            "edge_id": ["e+", "e-"],
+            "chromosome": ["chr1", "chr1"],
+            "strand": ["+", "-"],
+            "region_start": [90, 90],
+            "region_end": [110, 110],
+            "anchor_position": [100, 100],
+            "region_type": ["exon", "exon"],
+            "anchor_type": ["donor", "donor"],
+            "geometry_kind": ["site_window", "site_window"],
         }
     )
-    mapping = pd.DataFrame(
-        {
-            "modality": ["RNA"],
-            "motif_id": ["M"],
-            "factor_id": ["factor:FOO"],
-            "factor_group_id": ["group:FOO"],
-        }
+    routes = build_candidate_routes(events, anchors)
+    overlap = routes.loc[
+        (routes.event_id == "overlap") & (routes.anchor_region_id == "plus")
+    ].iloc[0]
+    touch = routes.loc[
+        (routes.event_id == "touch") & (routes.anchor_region_id == "plus")
+    ].iloc[0]
+    negative = routes.loc[
+        (routes.event_id == "negative") & (routes.anchor_region_id == "minus")
+    ].iloc[0]
+    assert overlap.transcript_oriented_side == "OVERLAP_ANCHOR"
+    assert np.isnan(overlap.signed_distance_bp)
+    assert touch.transcript_oriented_side == "UPSTREAM"
+    assert touch.signed_distance_bp == -1.0
+    assert negative.transcript_oriented_side == "UPSTREAM"
+    assert negative.signed_distance_bp == -4.5
+
+
+def test_overlap_geometry_uses_zero_cap_proximity_without_nan_ordering():
+    events = pd.DataFrame([_event("overlap"), _event("near")]).set_index(
+        "event_id", drop=False
     )
-
-    events = scan_motif_regions(
-        regions,
-        {"M": pwm},
-        mapping,
-        modality="RNA",
-        minimum_relative_score=0.95,
+    routes = pd.DataFrame(
+        [
+            {**_route("ro", "overlap"), "transcript_oriented_side": "OVERLAP_ANCHOR", "signed_distance_bp": np.nan},
+            {**_route("rn", "near"), "signed_distance_bp": 0.5},
+        ]
     )
-
-    assert len(events) == events["event_id"].nunique() == 3
-    assert events["event_id"].str.contains("factor_id=factor:FOO", regex=False).all()
-    assert events["event_id"].str.contains("anchor_0based=", regex=False).all()
-    assert events["event_id"].str.contains("region_type=", regex=False).all()
+    selected, _ = _cap_route_decisions(routes, events, 1)
+    assert selected.loc[selected.cap_selected, "event_id"].tolist() == ["overlap"]
 
 
-def test_empty_event_features_keep_the_fixed_nonempty_schema_width():
-    cases = (
-        ("DNA", "same_transcript", "peak", ("peak",)),
-        ("RNA", "transcribed", "exon", ("exon", "intron")),
-    )
-    for modality, orientation, region_type, region_order in cases:
-        events = pd.DataFrame(
-            {
-                "factor_id": ["f0"],
-                "motif_score": [0.8],
-                "orientation": [orientation],
-                "signed_distance_bp": [25.0],
-                "region_type": [region_type],
-                "peak_support": [3.0],
-            }
-        )
-        nonempty = fixed_event_feature_matrix(
-            events,
-            modality=modality,
-            factor_order=("f0", "f1"),
-            region_order=region_order,
-            distance_scale_bp=100.0,
-        )
-        empty = fixed_event_feature_matrix(
-            events.iloc[:0],
-            modality=modality,
-            factor_order=("f0", "f1"),
-            region_order=region_order,
-            distance_scale_bp=100.0,
-        )
-        assert nonempty.ndim == empty.ndim == 2
-        assert empty.shape == (0, nonempty.shape[1])
-        assert empty.dtype == nonempty.dtype == np.float32
+def test_cap_keeps_sixteen_per_dna_evidence_class_for_thirty_two_total():
+    event_rows = []
+    route_rows = []
+    for cap_class in ("motif_anchored", "accessibility_only"):
+        for index in range(20):
+            event_id = f"{cap_class}:{index:02d}"
+            event_rows.append(
+                _event(
+                    event_id,
+                    modality="DNA",
+                    quality=float(20 - index),
+                    peak=float(20 - index),
+                    cap_class=cap_class,
+                )
+            )
+            route_rows.append(
+                _route(f"r:{event_id}", event_id, modality="DNA")
+            )
+    events = pd.DataFrame(event_rows).set_index("event_id", drop=False)
+    decisions, audit = _cap_route_decisions(pd.DataFrame(route_rows), events, 16)
+    assert int(decisions.cap_selected.sum()) == 32
+    assert audit.groupby("cap_evidence_class").selected_event_count.first().to_dict() == {
+        "accessibility_only": 16,
+        "motif_anchored": 16,
+    }
