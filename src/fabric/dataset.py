@@ -1894,6 +1894,9 @@ def build_model_injection_equivalence_index(
     route_by_id = event_routes.sort_values("route_id", kind="mergesort")
     base_index = {value: index for index, value in enumerate(route_base.route_ids)}
     interaction_index_by_modality: dict[str, dict[str, int]] = {}
+    interaction_values_by_modality: dict[
+        str, np.ndarray | sparse.csr_matrix
+    ] = {}
     for modality in ("DNA", "RNA"):
         ids = [
             route_base.route_ids[index]
@@ -1902,6 +1905,10 @@ def build_model_injection_equivalence_index(
         interaction_index_by_modality[modality] = {
             value: index for index, value in enumerate(ids)
         }
+        values = interaction.values_by_modality[modality]
+        interaction_values_by_modality[modality] = (
+            values.tocsr() if sparse.issparse(values) else np.asarray(values)
+        )
     signatures: dict[tuple[object, ...], list[str]] = {}
     materialized: dict[str, dict[str, object]] = {}
     event_meta = active_events.set_index(active_events["event_id"].astype(str))
@@ -1921,14 +1928,29 @@ def build_model_injection_equivalence_index(
             [name.startswith(f"{modality}:") for name in route_base.column_names],
             dtype=bool,
         )
-        beta = {
-            edge: np.zeros(int(base_columns.sum()), dtype=np.float64) for edge in edges
-        }
-        int_width = int(interaction.values_by_modality[modality].shape[1])
-        iota = {edge: np.zeros(int_width, dtype=np.float64) for edge in edges}
+        beta: dict[str, dict[int, float]] = {edge: {} for edge in edges}
+        interaction_values = interaction_values_by_modality[modality]
+        int_width = int(interaction_values.shape[1])
+        iota: dict[str, dict[int, float]] = {edge: {} for edge in edges}
         edge_set = set(edges)
         modality_interaction_index = interaction_index_by_modality[modality]
-        active_mask = interaction.active_mask_by_modality[modality].astype(np.float64)
+        active_mask = interaction.active_mask_by_modality[modality].astype(bool)
+        if active_mask.shape != (int_width,):
+            raise ValueError("interaction active mask differs from padded width")
+
+        def accumulate(
+            target: dict[int, float],
+            indices: np.ndarray,
+            values: np.ndarray,
+            weight: float,
+        ) -> None:
+            for column, raw_value in zip(indices, values, strict=True):
+                value = target.get(int(column), 0.0) + weight * float(raw_value)
+                if value == 0:
+                    target.pop(int(column), None)
+                else:
+                    target[int(column)] = value
+
         for route in event_rows.itertuples(index=False):
             route_id = str(route.route_id)
             edge_id = str(route.edge_id)
@@ -1937,17 +1959,48 @@ def build_model_injection_equivalence_index(
             if route_id not in base_index or route_id not in modality_interaction_index:
                 raise ValueError("event route is absent from frozen encoded designs")
             weight = float(route.route_weight)
-            beta[edge_id] += weight * route_base.values[
+            base_row = route_base.values[
                 base_index[route_id], base_columns
             ].astype(np.float64)
-            iota[edge_id] += weight * (
-                interaction.values_by_modality[modality][
-                    modality_interaction_index[route_id]
-                ].astype(np.float64)
-                * active_mask
+            base_nonzero = np.flatnonzero(base_row)
+            accumulate(
+                beta[edge_id],
+                base_nonzero,
+                base_row[base_nonzero],
+                weight,
             )
-        beta_values = [_canonical_zero_vector(beta[edge]) for edge in edges]
-        iota_values = [_canonical_zero_vector(iota[edge]) for edge in edges]
+            interaction_row_index = modality_interaction_index[route_id]
+            if sparse.issparse(interaction_values):
+                interaction_row = interaction_values.getrow(interaction_row_index)
+                keep = active_mask[interaction_row.indices] & (
+                    interaction_row.data != 0
+                )
+                interaction_indices = interaction_row.indices[keep]
+                interaction_data = interaction_row.data[keep]
+            else:
+                interaction_row = np.asarray(
+                    interaction_values[interaction_row_index], dtype=np.float64
+                )
+                interaction_indices = np.flatnonzero(active_mask & (interaction_row != 0))
+                interaction_data = interaction_row[interaction_indices]
+            accumulate(
+                iota[edge_id],
+                interaction_indices,
+                interaction_data,
+                weight,
+            )
+
+        def canonical_sparse(
+            values: Mapping[int, float],
+        ) -> tuple[tuple[int, float], ...]:
+            return tuple(
+                (int(column), 0.0 if value == 0 else float(value))
+                for column, value in sorted(values.items())
+                if value != 0
+            )
+
+        beta_values = [canonical_sparse(beta[edge]) for edge in edges]
+        iota_values = [canonical_sparse(iota[edge]) for edge in edges]
         signature = (
             gene_id,
             modality,
@@ -1963,8 +2016,22 @@ def build_model_injection_equivalence_index(
             "modality": modality,
             "gate_key_id": str(event.gate_key_id),
             "ordered_edge_ids": list(edges),
-            "per_edge_beta_base": beta_values,
-            "per_edge_iota_masked_interaction": iota_values,
+            "base_width": int(base_columns.sum()),
+            "interaction_padded_width": int_width,
+            "per_edge_beta_base_sparse": [
+                [
+                    {"column_index": column, "value": value}
+                    for column, value in vector
+                ]
+                for vector in beta_values
+            ],
+            "per_edge_iota_masked_interaction_sparse": [
+                [
+                    {"column_index": column, "value": value}
+                    for column, value in vector
+                ]
+                for vector in iota_values
+            ],
             "member_route_ids": list(event_rows["route_id"].astype(str)),
             "anchor_region_ids": sorted(set(event_rows["anchor_region_id"].astype(str))),
         }
@@ -1990,8 +2057,10 @@ def build_model_injection_equivalence_index(
                     "signature": [
                         [
                             edge,
-                            first["per_edge_beta_base"][index],
-                            first["per_edge_iota_masked_interaction"][index],
+                            first["per_edge_beta_base_sparse"][index],
+                            first[
+                                "per_edge_iota_masked_interaction_sparse"
+                            ][index],
                         ]
                         for index, edge in enumerate(first["ordered_edge_ids"])
                     ],
@@ -2021,9 +2090,13 @@ def build_model_injection_equivalence_index(
                 "member_event_ids": members,
                 "member_count": len(members),
                 "ordered_edge_ids": first["ordered_edge_ids"],
-                "per_edge_beta_base": first["per_edge_beta_base"],
-                "per_edge_iota_masked_interaction": first[
-                    "per_edge_iota_masked_interaction"
+                "base_width": first["base_width"],
+                "interaction_padded_width": first["interaction_padded_width"],
+                "per_edge_beta_base_sparse": first[
+                    "per_edge_beta_base_sparse"
+                ],
+                "per_edge_iota_masked_interaction_sparse": first[
+                    "per_edge_iota_masked_interaction_sparse"
                 ],
                 "member_route_ids": all_routes,
                 "anchor_region_ids": all_anchors,
