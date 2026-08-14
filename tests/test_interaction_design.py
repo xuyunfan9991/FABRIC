@@ -4,6 +4,7 @@ import copy
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import sparse
 
 from fabric.dataset import (
     GateValues,
@@ -222,7 +223,9 @@ def test_production_is_modality_specific_and_gene_local_missing_levels_are_allow
     assert all(not name.startswith("RNA:") for name in base.column_names[: tensors.route_base_features.shape[1]])
 
 
-def test_injection_signature_keeps_exact_micro_difference_and_ignores_negative_zero():
+def test_injection_signature_keeps_exact_micro_difference_and_ignores_negative_zero(
+    tmp_path,
+):
     events, routes, base, _, interaction = _design()
     # Only two events with identical gate and edge can be compared.  Give them
     # exact-zero vs -0.0 in a masked interaction position: same group.
@@ -267,6 +270,62 @@ def test_injection_signature_keeps_exact_micro_difference_and_ignores_negative_z
         ordered_edge_ids_by_gene={"g": ["edge"]},
     )
     assert grouped.member_count.tolist() == [2]
+    assert grouped.iloc[0].per_edge_iota_masked_interaction_sparse == [[]]
+    assert "per_edge_iota_masked_interaction" not in grouped
+    destination = tmp_path / "model_injection_equivalence.parquet"
+    grouped.to_parquet(destination, index=False)
+    restored = pd.read_parquet(destination)
+    assert restored.member_count.tolist() == [2]
+
+    sparse_interaction = type(local_interaction)(
+        route_ids=local_interaction.route_ids,
+        values_by_modality={
+            "DNA": sparse.csr_matrix(local_values),
+            "RNA": sparse.csr_matrix((0, 0), dtype=np.float32),
+        },
+        active_mask_by_modality=local_interaction.active_mask_by_modality,
+        route_indices_by_modality=local_interaction.route_indices_by_modality,
+        raw_support=local_interaction.raw_support,
+        manifest=local_interaction.manifest,
+        raw_contrasts=local_interaction.raw_contrasts,
+    )
+    sparse_grouped = build_model_injection_equivalence_index(
+        selected_events,
+        selected_routes,
+        local_base,
+        sparse_interaction,
+        ordered_edge_ids_by_gene={"g": ["edge"]},
+    )
+    assert sparse_grouped.model_injection_group_id.tolist() == (
+        grouped.model_injection_group_id.tolist()
+    )
+
+    assert local_values.shape[1]
+    active_mask = np.zeros(local_values.shape[1], dtype=bool)
+    active_mask[0] = True
+    interaction_changed = local_values.copy()
+    interaction_changed[1, 0] = np.float32(1e-6)
+    changed_interaction = type(local_interaction)(
+        route_ids=local_interaction.route_ids,
+        values_by_modality={
+            "DNA": sparse.csr_matrix(interaction_changed),
+            "RNA": sparse.csr_matrix((0, 0), dtype=np.float32),
+        },
+        active_mask_by_modality={"DNA": active_mask, "RNA": np.zeros(0, bool)},
+        route_indices_by_modality=local_interaction.route_indices_by_modality,
+        raw_support=local_interaction.raw_support,
+        manifest=local_interaction.manifest,
+        raw_contrasts=local_interaction.raw_contrasts,
+    )
+    interaction_split = build_model_injection_equivalence_index(
+        selected_events,
+        selected_routes,
+        local_base,
+        changed_interaction,
+        ordered_edge_ids_by_gene={"g": ["edge"]},
+    )
+    assert sorted(interaction_split.member_count) == [1, 1]
+
     # Any exact nonzero difference, however small, must split the group.
     changed = local_base.values.copy()
     changed[1, 0] += np.float32(1e-6)

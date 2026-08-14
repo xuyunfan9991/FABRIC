@@ -1552,12 +1552,12 @@ def _gene_model_injection_index(
         route_context=pd.DataFrame(),
     )
     dna_interaction = (
-        dna.route_interaction_features.toarray()
+        dna.route_interaction_features.tocsr()
         if sparse.issparse(dna.route_interaction_features)
         else np.asarray(dna.route_interaction_features)
     )
     rna_interaction = (
-        rna.route_interaction_features.toarray()
+        rna.route_interaction_features.tocsr()
         if sparse.issparse(rna.route_interaction_features)
         else np.asarray(rna.route_interaction_features)
     )

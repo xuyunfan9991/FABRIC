@@ -503,7 +503,7 @@ g(j),\,M(j),\,\tau(j),\,
 \right),
 \]
 
-并定义 \(j\equiv_{inj}k\iff\sigma(j)=\sigma(k)\)。signature 对该 gene 的完整稳定 edge axis 物化；没有注入的 edges 使用 exact-zero \((\beta,\iota)\)，不得因 sparse omission rule 不同而拆组。聚合按稳定 route ID 顺序执行，`-0.0` 随后 canonicalize 为 `0.0`。等价判断只精确比较 signature 中的 gene、modality、gate key 和这些最终 per-edge aggregates；individual route IDs、单条 route weights 及其分解只作 provenance，分解不同但 aggregate 完全相同仍属于同组。categorical/reference codes、availability masks、连续值和 active-basis interaction values 已经通过 \((\beta,\iota)\) 进入比较；任一最终 aggregate 精确不同才拆组。不得使用 tolerance、rounding、近邻或 fuzzy hash 建组。不同 gate keys 在有限 train cells 上碰巧相同、当前 cell 的 \(G=0\)，以及训练后由 \(W_M\) 或 \(W_X\) null space 造成的 checkpoint-specific collision，都不属于该冻结 index。
+并定义 \(j\equiv_{inj}k\iff\sigma(j)=\sigma(k)\)。signature 对该 gene 的完整稳定 edge axis 物化；没有注入的 edges 使用 exact-zero \((\beta,\iota)\)，不得因 sparse omission rule 不同而拆组。审计表按完整 edge axis 保存 canonical sparse coordinate records，空 coordinate list 就是该 edge 的 exact-zero vector；base column names、interaction padded width 和 active padded-column indices 由同一冻结 design manifests 给出，因此 sparse 表示不改变等价关系，也不在每个 group row 重复整条 feature axis。聚合按稳定 route ID 顺序执行，`-0.0` 随后 canonicalize 为 `0.0`。等价判断只精确比较 signature 中的 gene、modality、gate key 和这些最终 per-edge aggregates；individual route IDs、单条 route weights 及其分解只作 provenance，分解不同但 aggregate 完全相同仍属于同组。categorical/reference codes、availability masks、连续值和 active-basis interaction values 已经通过 \((\beta,\iota)\) 进入比较；任一最终 aggregate 精确不同才拆组。不得使用 tolerance、rounding、近邻或 fuzzy hash 建组。不同 gate keys 在有限 train cells 上碰巧相同、当前 cell 的 \(G=0\)，以及训练后由 \(W_M\) 或 \(W_X\) null space 造成的 checkpoint-specific collision，都不属于该冻结 index。
 
 每个 index row 至少保存：
 
@@ -514,7 +514,8 @@ modality
 gate_key_id
 member_event_ids and member_count
 ordered edge_ids
-per-edge beta_base and iota_masked_interaction
+base_width and interaction_padded_width
+per-edge beta_base_sparse and iota_masked_interaction_sparse coordinate records
 member_route_ids and anchor_region_ids
 footprint_relation = identical_interval | overlapping_under_frozen_rule | mixed_or_disjoint
 motif_family_relation = same_motif_equivalence_family | distinct_non_equivalent_families | accessibility_only | mixed_or_NA
