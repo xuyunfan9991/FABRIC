@@ -1,554 +1,820 @@
 from __future__ import annotations
 
+import copy
+import json
+import os
 from dataclasses import replace
+from pathlib import Path
+import subprocess
+import sys
+
 import numpy as np
 import pandas as pd
-import torch
 import pytest
+import torch
+import yaml
+from scipy import sparse
 
-from fabric.evaluate import (
-    FactorActivityContext,
-    GeneNullContext,
-    _train_likelihood_informative_cell_mass,
-    correction_scale_diagnostic,
-    permute_factor_activity_within_strata,
-    rebuild_stage_system_factor_null,
-    trained_scale_diagnostics,
-)
-from fabric.model import (
-    AlternativeBatch,
-    AugmentedPathReadout,
-    EventOutput,
-    EventScorer,
-    StateScorer,
-)
+from fabric.evaluate import OntMatrixKlTarget
+
 from fabric.train import (
-    HierarchyResult,
-    NORMALIZED_SOURCE_ROLES,
+    FULL_COHORT_SCOPE,
     PreparedDataset,
-    VARIANTS,
-    VariantModules,
-    _freeze_cis_outputs,
-    _loss_for_rows,
-    assert_full7198_ready,
-    fit_b0_path_logits,
-    frozen_toy_likelihood_parity_error,
+    RouteDegreeCapSyntheticConfig,
+    ValidationSnapshot,
+    bind_route_degree_cap_structural_audit,
+    build_optimizer,
+    build_paired_models,
+    evaluate_final_test,
     load_config,
+    main,
     make_toy_genes,
-    prepare_dataset_identity,
-    preparation_values_from_config,
-    train_paired_seeds,
-    train_hierarchy,
+    optimizer_parameter_groups,
+    run_route_degree_cap_synthetic,
+    select_lambda_pair,
+    split_informative_molecule_mass,
+    train_run,
+    training_manifest_from_config,
+    tune_optimizer_grid,
+    validation_ont_matrix_kl_monitor,
 )
-from fabric.model import EdgeGraphGPS
+from fabric.train import _route_synthetic_inputs
+from fabric.train import _evaluate_split as evaluate_split
 
 
-def _config(epochs: int = 8):
-    return {
-        "model": {
-            "cis_hidden_dim": 12,
-            "cis_heads": 3,
-            "state_rank": 3,
-            "dna_rank": 3,
-            "rna_rank": 3,
-            "path_length_prior_weight": 0.0,
-        },
-        "training": {
-            "seed": 17,
-            "learning_rate": 0.02,
-            "weight_decay": 0.0,
-            "max_epochs": epochs,
-            "ec_batch_rows": 64,
-            "variants": list(VARIANTS),
-            "formal_full7198_authorized": False,
-        },
-        "admission": {
-            "minimum_b0_validation_improvement": 0.0,
-            "real_fixture_directory": "tests/fixtures/real",
-        },
-    }
+def _one_epoch_config():
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 1
+    config["training"]["early_stopping_patience"] = 1
+    return config
 
 
-def test_toy_hierarchy_runs_all_variants_and_children_share_exact_parents():
-    result = train_hierarchy(make_toy_genes(), _config(), device="cpu")
-    assert result.admission["passed"]
-    assert set(result.metrics["variant"]) == set(VARIANTS)
-    assert np.isfinite(result.metrics["compatible_path_nll"]).all()
-    assert result.metrics["screening_evidence_only"].all()
-    for _, history in result.history.groupby("variant", sort=False):
-        assert history["train_nll"].min() < history.iloc[0]["train_nll"]
-
-    cis = result.modules["cis"].cis
-    assert all(result.modules[variant].cis is cis for variant in VARIANTS)
-    state_parent = result.modules["state"].state.state_dict()
-    for variant in ("state_dna", "state_rna", "state_dna_rna"):
-        child_state = result.modules[variant].state.state_dict()
-        for key in state_parent:
-            torch.testing.assert_close(
-                child_state[key], state_parent[key], atol=0, rtol=0
-            )
-    # Full owns fresh jointly trained scorers rather than either trained child.
-    assert result.modules["state_dna_rna"].dna is not result.modules["state_dna"].dna
-    assert result.modules["state_dna_rna"].rna is not result.modules["state_rna"].rna
-
-
-def test_frozen_toy_admission_covers_multi_path_sets_and_centered_inputs():
-    assert frozen_toy_likelihood_parity_error() <= 1.0e-15
-    gene = make_toy_genes()[0]
-    for values in (gene.state_features, gene.dna_gate, gene.rna_gate):
-        torch.testing.assert_close(
-            values[:20].sum(dim=0),
-            torch.zeros(values.shape[1]),
-            atol=2.0e-6,
-            rtol=0.0,
-        )
-
-
-def test_toy_uses_real_16d_processing_features_and_legal_path_adjacency():
-    gene = make_toy_genes()[0]
-    assert gene.graph.edge_features.shape == (7, 16)
-    observed = set(map(tuple, gene.graph.local_edge_index.T.tolist()))
-    expected = {
-        pair
-        for path in ((0, 1, 2, 3, 6), (0, 1, 4, 5, 6))
-        for left, right in zip(path[:-1], path[1:])
-        for pair in ((left, right), (right, left))
-    }
-    assert observed == expected
-
-
-def test_b0_uses_only_train_likelihood_informative_ec_with_laplace_one():
-    gene = make_toy_genes()[0]
-    logits = fit_b0_path_logits(gene)
-    counts = torch.ones(2, dtype=torch.float64)
-    for row in range(20):
-        compatible = gene.compatible_path_indices[row][gene.compatible_path_mask[row]]
-        counts[compatible] += gene.molecule_count[row].double() / len(compatible)
-    expected = (counts / counts.sum()).log().float()
-    torch.testing.assert_close(logits, expected)
-
-
-def test_all_dynamic_branches_are_zero_on_ineligible_choice():
-    gene = replace(
-        make_toy_genes()[0], alternative_eligible=torch.zeros(2, dtype=torch.bool)
+def _train_full(genes, config, *, seed, device, monitor_callback=None):
+    return train_run(
+        genes,
+        config,
+        seed=seed,
+        condition="full",
+        device=device,
+        monitor_callback=monitor_callback,
     )
-    cis = EdgeGraphGPS(gene.graph.edge_features.shape[1], 8, 2)
-    frozen = _freeze_cis_outputs(cis, [gene])
-    alternative_dim = frozen[gene.gene_id][1].h_base.shape[1]
-    state = StateScorer(4, alternative_dim, 2)
-    dna = EventScorer(6, alternative_dim, 2)
-    rna = EventScorer(5, alternative_dim, 2)
-    for module in (state, dna, rna):
-        torch.nn.init.constant_(module.U.weight, 0.2)
-        torch.nn.init.constant_(module.V.weight, 0.3)
-    rows = torch.arange(6)
-    readout = AugmentedPathReadout(0.0)
-    parent = _loss_for_rows(
-        gene,
-        rows,
-        VariantModules(cis, None, None, None),
-        frozen[gene.gene_id],
-        readout,
-    )
-    dynamic = _loss_for_rows(
-        gene,
-        rows,
-        VariantModules(cis, state, dna, rna),
-        frozen[gene.gene_id],
-        readout,
-    )
-    torch.testing.assert_close(dynamic.per_row_nll, parent.per_row_nll, atol=0, rtol=0)
 
 
-def test_fixed_stage_system_permutation_preserves_each_stratum_joint_rows():
-    activity = np.arange(30).reshape(10, 3)
-    stage = ["CS11"] * 5 + ["CS12"] * 5
-    system = ["A", "A", "B", "B", "B"] * 2
-    permuted, source = permute_factor_activity_within_strata(
-        activity, stage, system, seed=41
+def _toy_ont_target(gene):
+    val_cells = tuple(
+        cell_id
+        for cell_id, split in zip(gene.cell_ids, gene.cell_split, strict=True)
+        if split == "val"
     )
-    for key in sorted(set(zip(stage, system))):
-        rows = [index for index, value in enumerate(zip(stage, system)) if value == key]
-        assert sorted(map(tuple, permuted[rows])) == sorted(map(tuple, activity[rows]))
-        assert {(stage[index], system[index]) for index in source[rows]} == {key}
-
-
-def test_formal_null_rebuilds_train_centered_rna_and_dna_gates():
-    original = make_toy_genes()[0]
-    gene = replace(
-        original,
-        identifiable_row_mask=torch.zeros_like(original.identifiable_row_mask),
-    )
-    cell_count = len(gene.cell_ids)
-    activity = np.stack(
-        [np.linspace(0.2, 2.0, cell_count), np.linspace(2.5, 0.4, cell_count)],
-        axis=1,
-    )
-    factor_context = FactorActivityContext(
-        cell_ids=gene.cell_ids,
-        factor_ids=("f0", "f1"),
-        activity=activity,
-        observed=np.ones_like(activity, dtype=bool),
-        stage=tuple(["CS11"] * 15 + ["CS12"] * 15),
-        developmental_system=tuple(
-            ["neural"] * 10 + ["mesoderm"] * 10 + ["neural"] * 10
+    counts = np.ones((len(gene.path_ids), len(val_cells)), dtype=np.int64)
+    counts[0] = np.arange(2, 2 + len(val_cells), dtype=np.int64)
+    return OntMatrixKlTarget(
+        counts=sparse.csr_matrix(counts),
+        path_ids=gene.path_ids,
+        path_gene_ids=(gene.gene_id,) * len(gene.path_ids),
+        cell_ids=val_cells,
+        matrix_identity="toy-ont-matrix",
+        path_identity="toy-path-axis",
+        split_identity="toy-validation-split",
+        scope_policy=(
+            "likelihood_informative_validation_cell_gene_with_at_least_two_"
+            "positive_ont_paths"
         ),
     )
-    accessibility = np.stack(
-        [np.linspace(0.5, 1.5, cell_count), np.linspace(1.7, 0.7, cell_count)],
-        axis=1,
+
+
+def _enable_toy_ont_monitor(config):
+    config["monitor"]["enabled"] = True
+    config["monitor"]["target_root"] = "provided-by-test-callback"
+
+
+def _route_manifest(**overrides):
+    return run_route_degree_cap_synthetic(
+        replace(RouteDegreeCapSyntheticConfig(), **overrides)
     )
-    context = GeneNullContext(
-        gene_id=gene.gene_id,
-        cell_ids=gene.cell_ids,
-        dna_event_factor_index=np.array([0, 1]),
-        rna_event_factor_index=np.array([0, 1]),
-        dna_accessibility=accessibility,
-        dna_accessibility_observed=np.ones_like(accessibility, dtype=bool),
-        dna_reliability=np.ones_like(accessibility),
-    )
-    rebuilt, source = rebuild_stage_system_factor_null(
+
+
+def test_multiple_ec_rows_reuse_one_gene_cell_forward_and_fixed_split_denominator():
+    gene = make_toy_genes()[0]
+    config = _one_epoch_config()
+    model = build_paired_models(gene, config["model"], seed=7, device="cpu")["full"]
+    calls = []
+    handle = model.register_forward_hook(lambda *_: calls.append(1))
+    snapshot = evaluate_split(
         [gene],
-        factor_context,
-        [context],
-        seed=11,
-        minimum_valid_molecule_mass=1,
-        minimum_weighted_variance=1e-10,
+        model,
+        condition="full",
+        split="val",
+        model_config=config["model"],
+        resources=config["resources"],
     )
-    train = np.arange(20)
-    assert torch.count_nonzero(rebuilt[0].rna_gate[train]) > 0
-    assert torch.count_nonzero(rebuilt[0].dna_gate[train]) > 0
-    np.testing.assert_allclose(rebuilt[0].rna_gate[train].sum(0), 0.0, atol=1e-6)
-    np.testing.assert_allclose(rebuilt[0].dna_gate[train].sum(0), 0.0, atol=3e-6)
-    for index, source_row in enumerate(source):
-        assert factor_context.stage[index] == factor_context.stage[source_row]
-        assert (
-            factor_context.developmental_system[index]
-            == factor_context.developmental_system[source_row]
-        )
+    handle.remove()
+    assert len(calls) == 1
+    assert snapshot.predictions[0].path_logits.shape[0] == 3
+    assert snapshot.predictions[0].compatible_path_indices.shape[0] == 6
+    expected = float(
+        gene.molecule_count[
+            gene.informative_row_mask
+            & torch.tensor(
+                [gene.cell_split[int(cell)] == "val" for cell in gene.row_cell_index]
+            )
+        ].sum()
+    )
+    assert snapshot.informative_molecule_mass == expected
+    # The 50-molecule full-path audit rows are present but cannot dilute NLL.
+    assert snapshot.informative_molecule_mass < float(
+        gene.molecule_count[
+            torch.tensor(
+                [gene.cell_split[int(cell)] == "val" for cell in gene.row_cell_index]
+            )
+        ].sum()
+    )
 
 
-def test_null_centering_mass_uses_only_train_likelihood_informative_ec():
+def test_prepared_gene_identity_and_integer_mass_contract_fails_closed():
     gene = make_toy_genes()[0]
-    row_count = len(gene.split)
-    compatible = torch.full((row_count, 2), -1, dtype=torch.long)
-    compatible[:, 0] = gene.compatible_path_indices[:, 0]
-    mask = torch.zeros_like(compatible, dtype=torch.bool)
-    mask[:, 0] = True
-    # A train all-path row carries no path-likelihood information and must not
-    # enter a gate baseline even though it has positive molecule mass.
-    compatible[0] = torch.tensor([0, 1])
-    mask[0] = True
-    molecule_count = torch.arange(1, row_count + 1, dtype=torch.float32)
-    gene = replace(
-        gene,
-        compatible_path_indices=compatible,
-        compatible_path_mask=mask,
-        molecule_count=molecule_count,
-        identifiable_row_mask=torch.zeros(row_count, dtype=torch.bool),
-    )
-
-    observed = _train_likelihood_informative_cell_mass(gene)
-    expected = np.zeros(row_count, dtype=np.float64)
-    expected[1:20] = np.arange(2, 21, dtype=np.float64)
-    np.testing.assert_array_equal(observed, expected)
-
-
-def test_real_fixture_config_loads_and_full_config_refuses_launch():
-    real = load_config("configs/fabric_v1_real_fixture.yaml")
-    assert tuple(real["training"]["variants"]) == VARIANTS
-    full = load_config("configs/fabric_v1_full7198.yaml")
-    with pytest.raises(RuntimeError, match="not authorized"):
-        assert_full7198_ready(full)
-
-
-def test_formal_gate_rejects_bool_only_prepared_identity():
-    gene = make_toy_genes()[0]
-    fake = PreparedDataset(
-        genes=(gene,),
-        target_gene_ids=(gene.gene_id,),
-        graph_generation=gene.graph_generation,
-        split_source=gene.split_source,
-        factor_mapping_reviewed=True,
-    )
-    config = _config()
-    config["target_gene_count"] = 7_198
-    config["training"]["formal_full7198_authorized"] = True
-    with pytest.raises(RuntimeError, match="normalized source path identity"):
-        assert_full7198_ready(config, fake)
-
-
-def test_formal_gate_compares_prepared_normalized_source_paths(monkeypatch, tmp_path):
-    expected = {role: tmp_path / f"expected_{role}" for role in NORMALIZED_SOURCE_ROLES}
-    prepared_paths = dict(expected)
-    prepared_paths["rna_counts"] = tmp_path / "wrong_rna_counts"
-    reviewed_mapping = tmp_path / "reviewed_factor_mapping.tsv"
-    reviewed_mapping.touch()
-    donor_eligibility = tmp_path / "atac_donor_eligibility.tsv"
-    donor_eligibility.touch()
-    peak_support = tmp_path / "peak_support.tsv"
-    peak_support.touch()
-    config = load_config("configs/fabric_v1_toy.yaml")
-    config.update(
-        target_gene_count=7_198,
-        external_inputs="unused-by-test",
-        factor_identity={"reviewed_mapping": str(reviewed_mapping)},
-    )
-    config["data"]["atac_neighbors"]["donor_eligibility_path"] = str(donor_eligibility)
-    config["motifs"]["peak_support_path"] = str(peak_support)
-    config["training"]["formal_full7198_authorized"] = True
-    prepared = prepare_dataset_identity(
-        make_toy_genes(),
-        factor_mapping_reviewed=True,
-        normalized_source_paths=prepared_paths,
-        reviewed_factor_mapping=reviewed_mapping,
-        atac_donor_eligibility_source=donor_eligibility,
-        peak_support_source=peak_support,
-        preparation_config_source=tmp_path / "preparation.yaml",
-        preparation_values=preparation_values_from_config(config),
-    )
-
-    class ExternalInputs:
-        def path(self, role):
-            return expected[role]
-
-    monkeypatch.setattr(
-        "fabric.annotation.load_external_inputs", lambda _: ExternalInputs()
-    )
-    with pytest.raises(RuntimeError, match="rna_counts"):
-        assert_full7198_ready(config, prepared)
-
-
-def test_formal_gate_rejects_changed_preparation_value(monkeypatch, tmp_path):
-    expected = {role: tmp_path / f"expected_{role}" for role in NORMALIZED_SOURCE_ROLES}
-    reviewed_mapping = tmp_path / "reviewed_factor_mapping.tsv"
-    donor_eligibility = tmp_path / "atac_donor_eligibility.tsv"
-    peak_support = tmp_path / "peak_support.tsv"
-    for path in (reviewed_mapping, donor_eligibility, peak_support):
-        path.touch()
-    config = load_config("configs/fabric_v1_toy.yaml")
-    config.update(
-        target_gene_count=7_198,
-        external_inputs="unused-by-test",
-        factor_identity={"reviewed_mapping": str(reviewed_mapping)},
-    )
-    config["data"]["atac_neighbors"]["donor_eligibility_path"] = str(donor_eligibility)
-    config["motifs"]["peak_support_path"] = str(peak_support)
-    config["training"]["formal_full7198_authorized"] = True
-    prepared = prepare_dataset_identity(
-        make_toy_genes(),
-        factor_mapping_reviewed=True,
-        normalized_source_paths=expected,
-        reviewed_factor_mapping=reviewed_mapping,
-        atac_donor_eligibility_source=donor_eligibility,
-        peak_support_source=peak_support,
-        preparation_config_source=tmp_path / "preparation.yaml",
-        preparation_values=preparation_values_from_config(config),
-    )
-    config["data"]["target_sum_rna"] = 20_000.0
-
-    class ExternalInputs:
-        def path(self, role):
-            return expected[role]
-
-    monkeypatch.setattr(
-        "fabric.annotation.load_external_inputs", lambda _: ExternalInputs()
-    )
-    with pytest.raises(RuntimeError, match="preparation values differ"):
-        assert_full7198_ready(config, prepared)
-
-
-def test_paired_seed_driver_runs_independent_fixed_hierarchies(tmp_path):
-    config = _config(epochs=2)
-    config["training"].pop("seed")
-    config["training"]["seeds"] = [101, 202]
-    config["admission"]["minimum_b0_validation_improvement"] = -1.0e9
-    results = train_paired_seeds(
-        make_toy_genes(), config, device="cpu", run_dir=tmp_path
-    )
-    assert set(results) == {101, 202}
-    assert (tmp_path / "paired_seed_metrics.tsv").exists()
-    assert (tmp_path / "seed_101" / "input_identity.json").exists()
-    assert results[101].modules["cis"].cis is not results[202].modules["cis"].cis
-    assert all(
-        result.metrics["screening_evidence_only"].all() for result in results.values()
-    )
-    primary = pd.read_csv(
-        tmp_path / "seed_101" / "evaluation" / "primary_metrics.tsv", sep="\t"
-    )
-    assert primary["screening_evidence_only"].all()
-
-
-def test_authorized_full7198_cannot_label_toy_results_as_formal(tmp_path):
-    config = _config(epochs=1)
-    config["target_gene_count"] = 7_198
-    config["training"].pop("seed")
-    config["training"]["seeds"] = [303, 404]
-    config["training"]["formal_full7198_authorized"] = True
-    config["admission"]["minimum_b0_validation_improvement"] = -1.0e9
-    with pytest.raises(RuntimeError, match="validated PreparedDataset"):
-        train_paired_seeds(
-            make_toy_genes(),
-            config,
+    noninteger = gene.molecule_count.clone()
+    noninteger[0] = 1.5
+    with pytest.raises(ValueError, match="integer molecule mass"):
+        _train_full(
+            [replace(gene, molecule_count=noninteger)],
+            _one_epoch_config(),
+            seed=101,
             device="cpu",
-            run_dir=tmp_path,
         )
-    assert not any(tmp_path.iterdir())
 
-
-def test_scale_diagnostic_preserves_original_sparse_choice_indices():
-    correction = np.asarray(
-        [
-            [1.0, -1.0, 3.0, -3.0],
-            [1.0, -1.0, 3.0, -3.0],
-        ]
-    )
-    values, correlations = correction_scale_diagnostic(
-        correction,
-        [0, 0, 2, 2],
-        event_count=[1.0, 99.0, 2.0],
-        alternative_span=[10.0, 1_000.0, 30.0],
-        cap_saturated=[0.0, 1.0, 1.0],
-        audited_choice_indices=[0, 2],
-    )
-
-    assert values["choice_index"].tolist() == [0, 2]
-    np.testing.assert_allclose(values["rms_delta"], [1.0, 3.0])
-    np.testing.assert_allclose(values["alternative_span"], [10.0, 30.0])
-    span_correlation = correlations.set_index("covariate").loc[
-        "alternative_span", "spearman_r"
-    ]
-    assert span_correlation == pytest.approx(1.0)
-
-
-class _FixedEventCorrection(torch.nn.Module):
-    def forward(self, batch, alternatives):
-        correction = batch.gate.new_tensor([1.0, -1.0, 0.0, 0.0, 3.0, -3.0])
-        correction = correction.expand(batch.gate.shape[0], -1)
-        sensitivity = batch.features.new_zeros(
-            (batch.features.shape[0], alternatives.h_base.shape[0])
+    with pytest.raises(ValueError, match="path identity axis"):
+        _train_full(
+            [replace(gene, path_ids=("path_a", "path_a"))],
+            _one_epoch_config(),
+            seed=101,
+            device="cpu",
         )
-        return EventOutput(sensitivity, sensitivity, correction)
+
+    duplicate = gene.compatible_path_indices.clone()
+    duplicate_mask = gene.compatible_path_mask.clone()
+    duplicate[0] = torch.tensor([0, 0])
+    duplicate_mask[0] = True
+    with pytest.raises(ValueError, match="duplicate path identities"):
+        _train_full(
+            [
+                replace(
+                    gene,
+                    compatible_path_indices=duplicate,
+                    compatible_path_mask=duplicate_mask,
+                )
+            ],
+            _one_epoch_config(),
+            seed=101,
+            device="cpu",
+        )
+
+    reversed_indices = gene.compatible_path_indices.clone()
+    reversed_mask = gene.compatible_path_mask.clone()
+    reversed_indices[0] = torch.tensor([1, 0])
+    reversed_mask[0] = True
+    with pytest.raises(ValueError, match="not in frozen path order"):
+        _train_full(
+            [
+                replace(
+                    gene,
+                    compatible_path_indices=reversed_indices,
+                    compatible_path_mask=reversed_mask,
+                )
+            ],
+            _one_epoch_config(),
+            seed=101,
+            device="cpu",
+        )
+
+    gapped_mask = gene.compatible_path_mask.clone()
+    gapped_mask[0] = torch.tensor([False, True])
+    with pytest.raises(ValueError, match="left-aligned prefix"):
+        _train_full(
+            [replace(gene, compatible_path_mask=gapped_mask)],
+            _one_epoch_config(),
+            seed=101,
+            device="cpu",
+        )
 
 
-def _three_choice_scale_gene():
+def test_epoch_uses_one_condition_and_the_global_train_denominator():
+    genes = make_toy_genes()
+    result = _train_full(genes, _one_epoch_config(), seed=101, device="cpu")
+    expected_mass = split_informative_molecule_mass(genes, "train")
+    history = result.result.history
+    assert history.loc[0, "epoch_train_denominator"] == expected_mass
+    assert history.loc[0, "visited_train_instances"] == 6
+    assert history.loc[0, "optimizer_step_unit"] == "train_positive_gene"
+    assert history.loc[0, "optimizer_steps"] == len(genes)
+    assert history.loc[0, "uniform_gene_step_objective_multiplier"] == len(genes)
+    assert set(result.metrics["condition"]) == {"full"}
+    assert set(result.metrics["split"]) == {"val"}
+    assert np.isfinite(result.metrics["validation_compatible_path_nll"]).all()
+
+
+def test_epoch_and_finalization_never_run_a_complete_train_evaluation(monkeypatch):
+    import fabric.train as train_module
+
+    observed_splits = []
+    original = train_module._evaluate_split
+
+    def counted_evaluation(*args, **kwargs):
+        observed_splits.append(kwargs["split"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(train_module, "_evaluate_split", counted_evaluation)
+    result = _train_full(make_toy_genes(), _one_epoch_config(), seed=101, device="cpu")
+    assert observed_splits == ["val"]
+    assert "train_nll" not in result.result.history
+    assert set(result.metrics["split"]) == {"val"}
+
+
+def test_gene_shape_budget_batches_cells_without_changing_epoch_estimand_or_update():
+    genes = make_toy_genes()
+    small = _one_epoch_config()
+    large = copy.deepcopy(small)
+    small["resources"]["target_gpu_allocated_bytes"] = 1_075_000
+    large["resources"]["target_gpu_allocated_bytes"] = 2_000_000
+    batched = _train_full(genes, small, seed=101, device="cpu")
+    unbatched = _train_full(genes, large, seed=101, device="cpu")
+    batched_history = batched.result.history.iloc[0]
+    unbatched_history = unbatched.result.history.iloc[0]
+    assert batched_history["visited_train_instances"] == 6
+    assert unbatched_history["visited_train_instances"] == 6
+    assert batched_history["train_cell_batch_count"] == 6
+    assert unbatched_history["train_cell_batch_count"] == 1
+    assert batched_history["maximum_train_batch_cells"] == 1
+    assert unbatched_history["maximum_train_batch_cells"] == 6
+    assert batched_history["optimizer_steps"] == 1
+    assert unbatched_history["optimizer_steps"] == 1
+    assert (
+        batched_history["epoch_train_denominator"]
+        == unbatched_history["epoch_train_denominator"]
+    )
+    assert batched_history["validation_compatible_path_nll"] == pytest.approx(
+        unbatched_history["validation_compatible_path_nll"], abs=1e-7
+    )
+    tolerance = small["resources"]["batching_probability_tolerance"]
+    for split in ("train", "val"):
+        left = evaluate_split(
+            genes,
+            batched.result.model,
+            condition="full",
+            split=split,
+            model_config=small["model"],
+            resources=large["resources"],
+        )
+        right = evaluate_split(
+            genes,
+            unbatched.result.model,
+            condition="full",
+            split=split,
+            model_config=large["model"],
+            resources=large["resources"],
+        )
+        assert left.nll == pytest.approx(right.nll, abs=tolerance)
+        for left_prediction, right_prediction in zip(
+            left.predictions, right.predictions, strict=True
+        ):
+            torch.testing.assert_close(
+                left_prediction.path_logits.log_softmax(dim=-1),
+                right_prediction.path_logits.log_softmax(dim=-1),
+                atol=tolerance,
+                rtol=0,
+            )
+
+
+def test_optimizer_steps_once_per_gene_after_all_gene_cell_microbatches(monkeypatch):
     gene = make_toy_genes()[0]
-    alternatives = AlternativeBatch(
-        edge_index=gene.alternatives.edge_index.repeat(3, 1),
-        edge_mask=gene.alternatives.edge_mask.repeat(3, 1),
-        choice_index=torch.tensor([0, 0, 1, 1, 2, 2]),
-        scope_index=gene.alternatives.scope_index.repeat(3),
-    )
-    event_choices = torch.tensor([0, 1, 1, 2, 2, 2])
-    relation = torch.zeros((len(event_choices), 6))
-    for event_index, choice in enumerate(event_choices):
-        relation[event_index, 2 * choice : 2 * choice + 2] = torch.tensor([1.0, -1.0])
-    return replace(
-        gene,
-        alternatives=alternatives,
-        alternative_eligible=torch.tensor([True, True, False, False, True, True]),
-        dna_event_features=gene.dna_event_features[:1].repeat(6, 1),
-        dna_event_relation=relation,
-        dna_event_choice_index=event_choices,
-        dna_gate=gene.dna_gate[:, :1].repeat(1, 6),
-        dna_event_ids=tuple(f"dna_{index}" for index in range(6)),
-        dna_event_factor_ids=tuple(f"factor_{index}" for index in range(6)),
-        dna_event_peak_ids=tuple(f"peak_{index}" for index in range(6)),
-        rna_event_features=gene.rna_event_features[:1].repeat(6, 1),
-        rna_event_relation=relation,
-        rna_event_choice_index=event_choices,
-        rna_gate=gene.rna_gate[:, :1].repeat(1, 6),
-        rna_event_ids=tuple(f"rna_{index}" for index in range(6)),
-        rna_event_factor_ids=tuple(f"factor_{index}" for index in range(6)),
-        alternative_span=torch.tensor([10.0, 1_000.0, 30.0]),
-        dna_candidate_event_count=torch.tensor([1.0, 2.0, 3.0]),
-        dna_selected_event_count=torch.tensor([1.0, 2.0, 3.0]),
-        dna_cap_saturated=torch.tensor([0.0, 0.0, 1.0]),
-        dna_boundary_rank_motif_score=torch.tensor([0.9, 0.8, 0.7]),
-        rna_candidate_event_count=torch.tensor([1.0, 2.0, 3.0]),
-        rna_selected_event_count=torch.tensor([1.0, 2.0, 3.0]),
-        rna_cap_saturated=torch.tensor([1.0, 0.0, 0.0]),
-        rna_boundary_rank_motif_score=torch.tensor([0.9, 0.8, 0.7]),
-    )
+    genes = (gene, replace(gene, gene_id="TOY_GENE_SECOND"))
+    config = _one_epoch_config()
+    config["resources"]["target_gpu_allocated_bytes"] = 1_075_000
+    calls = 0
+    original_step = torch.optim.AdamW.step
+
+    def counted_step(optimizer, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+    result = _train_full(genes, config, seed=101, device="cpu")
+    row = result.result.history.iloc[0]
+    assert row["train_cell_batch_count"] == 12
+    assert row["optimizer_steps"] == calls == 2
+    assert row["train_positive_gene_count"] == 2
+    assert row["uniform_gene_step_objective_multiplier"] == 2
+    assert row["gene_microbatch_gradient_accumulation"]
 
 
-def _fixed_scale_result(gene):
-    cis = EdgeGraphGPS(gene.graph.edge_features.shape[1], 12, 3)
-    event = _FixedEventCorrection()
-    return HierarchyResult(
-        modules={
-            "cis": VariantModules(cis, None, None, None),
-            "state_dna": VariantModules(cis, None, event, None),
-            "state_rna": VariantModules(cis, None, None, event),
-            "state_dna_rna": VariantModules(cis, None, event, event),
+def test_gradient_clipping_precedes_each_gene_step_and_plateau_uses_validation_nll(
+    monkeypatch,
+):
+    gene = make_toy_genes()[0]
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 3
+    config["training"]["early_stopping_patience"] = 3
+    config["optimizer"]["learning_rate"] = 0.01
+    config["optimizer"]["lr_scheduler"] = {
+        "name": "reduce_on_plateau",
+        "factor": 0.5,
+        "patience": 0,
+        "min_lr": 0.001,
+    }
+    config["optimizer"]["gradient_clip_norm"] = 1.0
+    events = []
+    original_clip = torch.nn.utils.clip_grad_norm_
+    original_step = torch.optim.AdamW.step
+
+    def recorded_clip(parameters, *args, **kwargs):
+        events.append("clip")
+        return original_clip(parameters, *args, **kwargs)
+
+    def recorded_step(optimizer, *args, **kwargs):
+        events.append("step")
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", recorded_clip)
+    monkeypatch.setattr(torch.optim.AdamW, "step", recorded_step)
+    monkeypatch.setattr(
+        "fabric.train._evaluate_split",
+        lambda *args, **kwargs: ValidationSnapshot(
+            split="val",
+            weighted_nll_sum=1.0,
+            informative_molecule_mass=1.0,
+            predictions=(),
+        ),
+    )
+    result = _train_full((gene,), config, seed=101, device="cpu")
+    history = result.result.history
+    assert events == ["clip", "step"] * 3
+    assert history["epoch_learning_rate"].tolist() == pytest.approx([0.01, 0.01, 0.005])
+    assert history["next_epoch_learning_rate"].tolist() == pytest.approx(
+        [0.01, 0.005, 0.0025]
+    )
+    assert set(history["lr_scheduler"]) == {"reduce_on_plateau"}
+    assert set(history["gradient_clip_norm"]) == {1.0}
+    assert result.result.lr_scheduler_state_dict is not None
+
+
+def test_optimizer_groups_are_complete_disjoint_and_decay_only_declared_parameters():
+    gene = make_toy_genes()[0]
+    config = _one_epoch_config()
+    model = build_paired_models(gene, config["model"], seed=17, device="cpu")["full"]
+    groups = optimizer_parameter_groups(model, lambda_base=0.1, lambda_int=0.3)
+    assert [group["group_name"] for group in groups] == [
+        "no_decay",
+        "base",
+        "interaction",
+    ]
+    names = [name for group in groups for name in group["parameter_names"]]
+    assert len(names) == len(set(names)) == len(dict(model.named_parameters()))
+    assert set(groups[2]["parameter_names"]) == {
+        "dna_aggregator.interaction_projection.weight",
+        "rna_aggregator.interaction_projection.weight",
+    }
+    assert all(
+        name.endswith("bias") or "output_norm" in name
+        for name in groups[0]["parameter_names"]
+    )
+
+    optimizer = build_optimizer(
+        model, learning_rate=0.1, lambda_base=0.1, lambda_int=0.3
+    )
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    for parameter in model.parameters():
+        parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    after = dict(model.named_parameters())
+    no_decay = set(groups[0]["parameter_names"])
+    interaction = set(groups[2]["parameter_names"])
+    for name, original in before.items():
+        if name in no_decay:
+            torch.testing.assert_close(after[name], original, atol=0, rtol=0)
+        elif name in interaction:
+            torch.testing.assert_close(
+                after[name], original * 0.97, atol=1e-7, rtol=1e-7
+            )
+        else:
+            torch.testing.assert_close(
+                after[name], original * 0.99, atol=1e-7, rtol=1e-7
+            )
+
+
+def test_lambda_grid_selection_uses_only_three_dynamic_models_and_frozen_ties():
+    scores = {
+        (0.0, 0.01): {"cis_dna": 1.0, "cis_rna": 2.0, "full": 3.0},
+        (0.001, 0.02): {"cis_dna": 2.0, "cis_rna": 2.0, "full": 2.0},
+        (0.002, 0.02): {"cis_dna": 1.5, "cis_rna": 2.0, "full": 2.5},
+    }
+    # Same aggregate: larger lambda_int, then larger lambda_base wins.
+    assert select_lambda_pair(scores, list(scores)) == (0.002, 0.02)
+
+
+def test_optimizer_grid_orchestration_retrains_every_pair_seed_condition():
+    config = _one_epoch_config()
+    config["optimizer"]["tuning_seeds"] = [19]
+    selection = tune_optimizer_grid(
+        make_toy_genes(), config, device="cpu", monitor_callback=None
+    )
+    assert len(selection.runs) == 2 * 1 * 3
+    assert {
+        (run.lambda_base, run.lambda_int, run.tuning_seed, run.condition)
+        for run in selection.runs
+    } == {
+        (pair[0], pair[1], 19, condition)
+        for pair in selection.grid_order
+        for condition in ("cis_dna", "cis_rna", "full")
+    }
+    expected_aggregate = tuple(
+        float(np.mean(condition_means))
+        for condition_means in selection.condition_mean_validation_nll
+    )
+    assert selection.aggregate_validation_nll == pytest.approx(expected_aggregate)
+    assert selection.selected_pair == select_lambda_pair(
+        {
+            pair: dict(
+                zip(
+                    selection.selection_conditions,
+                    selection.condition_mean_validation_nll[index],
+                )
+            )
+            for index, pair in enumerate(selection.grid_order)
         },
-        metrics=pd.DataFrame(),
-        admission={},
-        history=pd.DataFrame(),
+        selection.grid_order,
     )
+    assert selection.frozen_config_fields()["selection_status"] == "FROZEN"
 
 
-def test_trained_scale_diagnostics_excludes_ineligible_choices_per_modality():
-    gene = _three_choice_scale_gene()
-    diagnostic, correlations = trained_scale_diagnostics(
-        _fixed_scale_result(gene), [gene], device="cpu", cell_batch_size=7
+def test_training_manifest_has_exactly_one_command_seed_and_condition():
+    config = load_config("configs/fabric_v2_toy.yaml")
+    manifest = training_manifest_from_config(config, seed=2207, condition="rbp")
+    manifest.validate()
+    assert manifest.seed == 2207
+    assert manifest.condition == "rbp"
+    with pytest.raises(ValueError, match="condition"):
+        replace(manifest, condition="cis_rna").validate()
+
+
+def test_config_freezes_optimizer_selection_and_claim_semantics(tmp_path):
+    config = _one_epoch_config()
+    changed = copy.deepcopy(config)
+    changed["optimizer"]["selected_pair"] = [0.0, 0.001]
+    path = tmp_path / "bad_selected_pair.yaml"
+    path.write_text(yaml.safe_dump(changed, sort_keys=False))
+    with pytest.raises(ValueError, match="differs from the runtime penalties"):
+        load_config(path)
+
+    changed = copy.deepcopy(config)
+    changed["optimizer"]["lr_scheduler"] = {"name": "cosine"}
+    path = tmp_path / "bad_schedule.yaml"
+    path.write_text(yaml.safe_dump(changed, sort_keys=False))
+    with pytest.raises(ValueError, match="constant or reduce_on_plateau"):
+        load_config(path)
+
+    changed = copy.deepcopy(config)
+    changed["optimizer"]["gradient_clip_norm"] = -1.0
+    path = tmp_path / "bad_clipping.yaml"
+    path.write_text(yaml.safe_dump(changed, sort_keys=False))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        load_config(path)
+
+    result = _train_full(make_toy_genes(), config, seed=101, device="cpu")
+    assert set(result.metrics["execution_scope"]) == {"toy"}
+
+
+def test_route_audit_manifest_freezes_generator_seeds_and_all_tolerances():
+    synthetic = _route_synthetic_inputs(torch.tensor([-1.0, 0.0, 1.0]))
+    assert synthetic["degree_2"].dna.route_edge_index.tolist() == [2, 3]
+    assert synthetic["degree_4"].dna.route_edge_index.tolist() == [2, 3, 4, 5]
+    assert synthetic["degree_8"].dna.route_edge_index.tolist() == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+    ]
+    assert [
+        synthetic[name].dna.route_weight.numel()
+        for name in ("cap_4_plus_2", "cap_2", "cap_0")
+    ] == [8, 4, 2]
+    for inputs in synthetic.values():
+        dense = inputs.path_edge_incidence.to_dense()
+        assert bool((dense.sum(dim=0) > 0).all())
+        assert torch.unique(inputs.dna.route_base_features, dim=0).shape[0] == 1
+    manifest = _route_manifest()
+    manifest.validate()
+    assert manifest.implementation_valid
+    assert manifest.baseline_capability_pass
+    assert manifest.route_degree_pass
+    assert manifest.cap_coupling_pass
+    assert manifest.failure_reasons == ()
+    assert len(manifest.measurements) == 18
+    with pytest.raises(ValueError, match="exactly three"):
+        _route_manifest(audit_seeds=(7, 7, 11))
+    with pytest.raises(ValueError, match="positive and finite"):
+        _route_manifest(cap_gradient_drift_tolerance=0.0)
+    with pytest.raises(ValueError, match="generator identity"):
+        _route_manifest(generator_identity="")
+    tampered_measurement = replace(
+        manifest.measurements[0],
+        matched_delta_rho=manifest.measurements[0].matched_delta_rho + 1.0,
     )
-
-    assert set(diagnostic["choice_index"]) == {0, 2}
-    assert len(diagnostic) == 8  # two eligible choices in four variant/modalities
-    assert (diagnostic.groupby(["variant", "modality"]).size() == 2).all()
-    np.testing.assert_allclose(
-        diagnostic.sort_values(["variant", "modality", "choice_index"])[
-            "rms_delta"
-        ].to_numpy(),
-        np.tile([1.0, 3.0], 4),
+    with pytest.raises(ValueError, match="recovery_error differs"):
+        replace(
+            manifest,
+            measurements=(tampered_measurement, *manifest.measurements[1:]),
+        )
+    structural = pd.DataFrame(
+        {
+            "audit_population": ["model_input", "model_input", "catalog"],
+            "event_id": ["high-degree", "external", "catalog-only"],
+            "D_post": [4, 2, 8],
+            "external_only_coupling": [False, True, True],
+        }
     )
-    span = correlations.loc[correlations["covariate"] == "alternative_span"]
-    np.testing.assert_allclose(span["spearman_r"], 1.0)
-    dna = diagnostic.loc[diagnostic["modality"] == "DNA"].sort_values(
-        ["variant", "choice_index"]
+    bound = bind_route_degree_cap_structural_audit(
+        RouteDegreeCapSyntheticConfig(),
+        structural,
+        structural_route_audit_identity="real-route-audit-v2",
     )
-    rna = diagnostic.loc[diagnostic["modality"] == "RNA"].sort_values(
-        ["variant", "choice_index"]
+    assert bound.model_input_degree_gt2_event_count == 1
+    assert bound.model_input_external_only_coupling_event_count == 1
+    no_applicability = bind_route_degree_cap_structural_audit(
+        RouteDegreeCapSyntheticConfig(),
+        structural.loc[structural.audit_population.eq("catalog")],
+        structural_route_audit_identity="empty-model-input-v2",
     )
-    assert dna["cap_saturated"].tolist() == [0.0, 1.0, 0.0, 1.0]
-    assert rna["cap_saturated"].tolist() == [1.0, 0.0, 1.0, 0.0]
-
-
-def test_trained_scale_diagnostics_rejects_mixed_eligibility_within_choice():
-    gene = _three_choice_scale_gene()
-    gene = replace(
-        gene,
-        alternative_eligible=torch.tensor([True, False, False, False, True, True]),
+    no_applicability_manifest = replace(
+        manifest,
+        structural_route_audit_identity=(
+            no_applicability.structural_route_audit_identity
+        ),
+        model_input_degree_gt2_event_count=(
+            no_applicability.model_input_degree_gt2_event_count
+        ),
+        model_input_external_only_coupling_event_count=(
+            no_applicability.model_input_external_only_coupling_event_count
+        ),
     )
-    with pytest.raises(ValueError, match="eligibility differs within choice 0"):
-        trained_scale_diagnostics(_fixed_scale_result(gene), [gene], device="cpu")
+    assert not no_applicability_manifest.route_degree_catalog_applicable
+    assert not no_applicability_manifest.cap_coupling_catalog_applicable
 
 
-def test_trained_scale_diagnostics_checks_selected_event_count_identity():
-    gene = _three_choice_scale_gene()
-    gene = replace(gene, dna_selected_event_count=torch.tensor([1.0, 9.0, 3.0]))
-    with pytest.raises(ValueError, match="DNA selected event count differs"):
-        trained_scale_diagnostics(_fixed_scale_result(gene), [gene], device="cpu")
+def test_full_cohort_guard_fails_before_data_gpu_or_run_directory(tmp_path):
+    config = load_config("configs/fabric_v2_full_cohort.yaml")
+    assert config["execution"]["scope"] == FULL_COHORT_SCOPE
+    run_dir = tmp_path / "must_not_exist"
+    with pytest.raises(RuntimeError, match="training is not authorized"):
+        main(
+            [
+                "--config",
+                "configs/fabric_v2_full_cohort.yaml",
+                "--run-dir",
+                str(run_dir),
+                "--device",
+                "cuda:999",
+                "--seed",
+                "1103",
+                "--condition",
+                "full",
+                "--fixture",
+                str(tmp_path / "missing.pt"),
+            ]
+        )
+    assert not run_dir.exists()
 
 
-def test_trained_scale_diagnostics_skips_graph_only_gene_without_cells():
-    gene = _three_choice_scale_gene()
-    graph_only = replace(
-        gene,
-        state_features=gene.state_features[:0],
-        dna_gate=gene.dna_gate[:0],
-        rna_gate=gene.rna_gate[:0],
-        compatible_path_indices=gene.compatible_path_indices[:0],
-        compatible_path_mask=gene.compatible_path_mask[:0],
-        row_cell_index=gene.row_cell_index[:0],
-        molecule_count=gene.molecule_count[:0],
-        split=(),
-        identifiable_row_mask=gene.identifiable_row_mask[:0],
-        cell_ids=(),
+def test_final_test_is_separate_from_training_and_gate_fails_closed():
+    genes = make_toy_genes()
+    toy = _one_epoch_config()
+    result = _train_full(genes, toy, seed=101, device="cpu")
+    # Training metrics contain no held-out predictions, even for toy execution.
+    assert set(result.metrics["split"]) == {"val"}
+    assert not toy["execution"]["final_test_authorized"]
+    with pytest.raises(RuntimeError, match="test inference is not authorized"):
+        evaluate_final_test(
+            genes,
+            result,
+            toy,
+            checkpoints_frozen=True,
+            report_rules_frozen=True,
+        )
+    authorized = copy.deepcopy(toy)
+    authorized["execution"]["final_test_authorized"] = True
+    toy_test = evaluate_final_test(
+        genes,
+        result,
+        authorized,
+        checkpoints_frozen=True,
+        report_rules_frozen=True,
     )
-    diagnostic, correlations = trained_scale_diagnostics(
-        _fixed_scale_result(graph_only), [graph_only], device="cpu"
+    assert set(toy_test["split"]) == {"test"}
+    with pytest.raises(RuntimeError, match="frozen checkpoints"):
+        evaluate_final_test(
+            genes,
+            result,
+            authorized,
+            checkpoints_frozen=False,
+            report_rules_frozen=True,
+        )
+
+
+def test_monitor_runs_once_after_each_epoch_and_cannot_change_checkpoint():
+    genes = make_toy_genes()
+    config = _one_epoch_config()
+    without = _train_full(genes, config, seed=303, device="cpu")
+    _enable_toy_ont_monitor(config)
+    target = _toy_ont_target(genes[0])
+    calls = []
+
+    def monitor(condition, epoch, snapshot):
+        calls.append((condition, epoch, len(snapshot.predictions)))
+        # Deliberately consume all RNG sources; trainer restores them.
+        _ = torch.rand(7)
+        _ = np.random.random(7)
+        return validation_ont_matrix_kl_monitor(
+            condition, epoch, snapshot, target=target
+        )
+
+    with_monitor = _train_full(
+        genes, config, seed=303, device="cpu", monitor_callback=monitor
     )
-    assert diagnostic.empty
-    assert correlations.empty
+    assert calls == [("full", 1, 1)]
+    left = without.result
+    right = with_monitor.result
+    assert left.best_epoch == right.best_epoch
+    assert left.best_validation_nll == right.best_validation_nll
+    assert len(right.monitor_records) == 1
+    assert right.monitor_records[0].sealed
+    assert not right.monitor_records[0].selection_eligible
+    assert set(right.history.columns) >= {
+        "validation_compatible_path_nll",
+        "ont_matrix_kl_count_weighted",
+    }
+    assert np.isfinite(right.history["ont_matrix_kl_count_weighted"]).all()
+    assert "train_nll" not in right.history
+    for key, value in left.model.state_dict().items():
+        torch.testing.assert_close(right.model.state_dict()[key], value, atol=0, rtol=0)
+
+
+def test_one_run_is_end_to_end_and_writes_v2_artifacts(tmp_path):
+    config = _one_epoch_config()
+    _enable_toy_ont_monitor(config)
+    genes = make_toy_genes()
+    target = _toy_ont_target(genes[0])
+    run_dir = tmp_path / "toy_run"
+    result = train_run(
+        genes,
+        config,
+        seed=101,
+        condition="atac",
+        device="cpu",
+        run_dir=run_dir,
+        monitor_callback=lambda condition, epoch, snapshot: (
+            validation_ont_matrix_kl_monitor(condition, epoch, snapshot, target=target)
+        ),
+    )
+    assert result.manifest.seed == 101
+    assert result.manifest.condition == "atac"
+    assert (run_dir / "training_run_manifest.json").exists()
+    assert (run_dir / "input_manifest.json").exists()
+    assert (run_dir / "metrics.tsv").exists()
+    assert (run_dir / "sealed_validation_monitor.jsonl").exists()
+    assert (run_dir / "optimizer_manifest.json").exists()
+    assert (run_dir / "checkpoint_manifest.json").exists()
+    assert (run_dir / "monitor_manifest.json").exists()
+    input_manifest = json.loads((run_dir / "input_manifest.json").read_text())
+    assert input_manifest["test_model_predictions_status"] == (
+        "NOT_COMPUTED_DURING_TRAINING"
+    )
+    assert input_manifest["gene_shape_adaptive_batching"]["batch_policy"] == (
+        "gene_shape_adaptive_v1"
+    )
+    assert (
+        input_manifest["gene_shape_adaptive_batching"][
+            "probability_numerical_tolerance"
+        ]
+        == 1.0e-6
+    )
+    optimizer_manifest = json.loads((run_dir / "optimizer_manifest.json").read_text())
+    assert optimizer_manifest["lr_scheduler"] == {"name": "constant"}
+    assert optimizer_manifest["gradient_clip_norm"] == 0.0
+    assert [
+        group["group_name"] for group in optimizer_manifest["parameter_groups"]
+    ] == [
+        "no_decay",
+        "base",
+        "interaction",
+    ]
+    checkpoint_manifest = json.loads((run_dir / "checkpoint_manifest.json").read_text())
+    assert not checkpoint_manifest["selection_rules_used_held_out_test"]
+    assert checkpoint_manifest["record"]["seed"] == 101
+    assert checkpoint_manifest["record"]["condition"] == "atac"
+    assert not checkpoint_manifest["record"]["held_out_test_evaluated"]
+    monitor_manifest = json.loads((run_dir / "monitor_manifest.json").read_text())
+    assert monitor_manifest["record_count"] == 1
+    assert monitor_manifest["all_records_sealed"]
+    assert not monitor_manifest["any_record_selection_eligible"]
+    assert not monitor_manifest["held_out_test_model_predictions_computed"]
+    assert len(result.metrics) == 1
+    assert set(result.metrics["split"]) == {"val"}
+    assert (run_dir / "checkpoint.pt").exists()
+    checkpoint = torch.load(
+        run_dir / "checkpoint.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["schema_version"] == "fabric.training_checkpoint.v2"
+    assert checkpoint["model_state_dict"]
+    assert checkpoint["optimizer_state_dict"]["state"]
+    assert checkpoint["lr_scheduler_state_dict"] is None
+    assert (run_dir / "history.tsv").exists()
+
+
+def test_python_module_cli_loads_exact_prepared_dataset_identity(tmp_path):
+    config = _one_epoch_config()
+    config["execution"]["scope"] = "fixture"
+    config["inputs"]["compatible_ec_scope"] = "serialized_v2_fixture"
+    config["inputs"]["test_exposure"] = "fixture_only"
+    config_path = tmp_path / "fixture.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    bundle_path = tmp_path / "prepared.pt"
+    torch.save(
+        PreparedDataset(
+            genes=tuple(make_toy_genes(seed=17)),
+            input_manifest_id="serialized-fixture-v2",
+            compatibility_artifact_id="toy-compatible-ec-v2",
+        ),
+        bundle_path,
+    )
+    run_dir = tmp_path / "module_run"
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = (
+        source_root
+        if not environment.get("PYTHONPATH")
+        else source_root + os.pathsep + environment["PYTHONPATH"]
+    )
+    environment["OMP_NUM_THREADS"] = "1"
+    environment["MKL_NUM_THREADS"] = "1"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "fabric.train",
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--device",
+            "cpu",
+            "--seed",
+            "17",
+            "--condition",
+            "rbp",
+            "--learning-rate",
+            "0.002",
+            "--lr-scheduler",
+            "reduce_on_plateau",
+            "--lr-factor",
+            "0.5",
+            "--lr-patience",
+            "0",
+            "--min-lr",
+            "0.0005",
+            "--gradient-clip-norm",
+            "0.7",
+            "--max-train-gene-cells-per-gene",
+            "2",
+            "--max-epochs",
+            "1",
+            "--early-stopping-patience",
+            "1",
+            "--fixture",
+            str(bundle_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=True,
+    )
+    metrics = pd.read_csv(run_dir / "metrics.tsv", sep="\t")
+    assert len(metrics) == 1
+    assert set(metrics["split"]) == {"val"}
+    assert set(metrics["condition"]) == {"rbp"}
+    resolved = yaml.safe_load((run_dir / "config.yaml").read_text())
+    assert resolved["optimizer"]["learning_rate"] == 0.002
+    assert resolved["optimizer"]["lr_scheduler"] == {
+        "name": "reduce_on_plateau",
+        "factor": 0.5,
+        "patience": 0,
+        "min_lr": 0.0005,
+    }
+    assert resolved["optimizer"]["gradient_clip_norm"] == 0.7
+    assert resolved["training"]["max_train_gene_cells_per_gene_per_epoch"] == 2
+    manifest = json.loads((run_dir / "training_run_manifest.json").read_text())
+    assert manifest["learning_rate"] == 0.002
+    assert manifest["lr_scheduler_name"] == "reduce_on_plateau"
+    assert manifest["gradient_clip_norm"] == 0.7

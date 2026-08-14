@@ -7,9 +7,13 @@ import numpy as np
 import pandas as pd
 import torch
 
-from fabric.annotation import canonical_rna_cell_id, load_split_rows
-from fabric.choices import choice_identifiability, extract_elementary_choices
-from fabric.graph import load_graph_tables, split_gene_graphs
+from fabric.choices import build_path_identifiability_index
+from fabric.graph import (
+    canonical_rna_cell_id,
+    load_graph_tables,
+    load_split_rows,
+    split_gene_graphs,
+)
 from fabric.likelihood import (
     brute_force_compatible_path_nll,
     compatible_path_nll,
@@ -84,7 +88,7 @@ def test_real_fixture_filters_import_scaffolding_and_rebinds_current_split():
     ] == sorted(ec["cell_id"])
 
 
-def test_real_fixture_negative_strand_choice_rank_support_and_exact_nll():
+def test_real_fixture_negative_strand_path_identifiability_and_exact_nll():
     metadata = json.loads((FIXTURE / "fixture.json").read_text())
     tables, graph, ec = _fixture_objects()
     node_position = tables.nodes.set_index("node_id")["pos_0based"]
@@ -96,35 +100,17 @@ def test_real_fixture_negative_strand_choice_rank_support_and_exact_nll():
             "negative-strand path order must run toward lower coordinates"
         )
 
-    catalog = extract_elementary_choices(graph)
-    assert len(catalog.choices) == 1
-    choice = catalog.choices[0]
-    assert (choice.entry_node_id, choice.exit_node_id) == (CHOICE_ENTRY, CHOICE_EXIT)
-    assert choice.scope == "internal"
-    assert choice.path_to_alternative == (0, 1)
-    assert {
-        graph.edges.iloc[alt.edge_indices[0]]["edge_type"]
-        for alt in choice.alternatives
-    } == {
-        "RETAINED_INTRON",
-        "SPLICE",
-    }
-    assert all(len(alt.edge_indices) == 1 for alt in choice.alternatives)
-    np.testing.assert_array_equal(catalog.path_choice_incidence.toarray(), np.eye(2))
-
-    audit = choice_identifiability(
-        catalog,
-        ec,
-        rank_tolerance=1e-8,
-        minimum_informative_molecule_mass=1,
-        minimum_alternative_support=1,
+    index = build_path_identifiability_index(
+        graph,
+        ec.rename(columns={"gene_id": "gene_id"}),
+        minimum_exclusive_support=1,
     )
-    assert audit.loc[0, "structural_rank"] == 1
-    assert audit.loc[0, "supervision_rank"] == 1
-    assert audit.loc[0, "informative_ec_count"] == 56
-    assert audit.loc[0, "informative_molecule_mass"] == 56
-    assert audit.loc[0, "alternative_support"] == [56.0, 56.0]
-    assert bool(audit.loc[0, "eligible"])
+    gene_audit = index.genes.iloc[0]
+    assert gene_audit.group_count == 2
+    assert gene_audit.augmented_rank == 2
+    assert bool(gene_audit.cohort_identifiable)
+    assert set(index.paths.path_id) == set(graph.path_ids)
+    assert set(index.groups.member_count) == {1}
     train_singleton_mass = (
         ec.loc[ec["split"] == "train"]
         .groupby("compatible_path_ids_key")["molecule_count"]

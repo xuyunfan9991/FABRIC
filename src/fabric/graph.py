@@ -11,9 +11,6 @@ import pandas as pd
 import pyarrow.dataset as pads
 from scipy import sparse
 
-from .annotation import canonical_rna_cell_id
-
-
 # SOURCE/SINK and START/END exist in the imported tables only as serialization
 # sentinels.  FABRIC's scientific graph starts at TSS, ends at PAS, and counts
 # only real processing transitions in M_edge and ell_p.
@@ -21,6 +18,35 @@ NODE_TYPES = ("TSS", "donor", "acceptor", "PAS")
 EDGE_TYPES = ("EXON_CONTINUATION", "SPLICE", "RETAINED_INTRON")
 IMPORTED_NODE_TYPES = ("SOURCE", *NODE_TYPES, "SINK")
 IMPORTED_EDGE_TYPES = ("START", *EDGE_TYPES, "END")
+
+
+def canonical_rna_cell_id(value: str) -> str:
+    """Remove only the documented RNA namespace at the graph import boundary."""
+
+    cell_id = str(value)
+    if cell_id.startswith("RNA__"):
+        cell_id = cell_id[5:]
+    if not cell_id:
+        raise ValueError("RNA cell_id must be non-empty")
+    return cell_id
+
+
+def load_split_rows(path: str | Path) -> pd.DataFrame:
+    """Load the frozen RNA split and fail on namespace-induced collisions."""
+
+    rows = pd.read_parquet(path, columns=["cell_id", "rna_embryo_id", "split"])
+    rows = rows.copy()
+    rows["source_split_cell_id"] = rows["cell_id"].astype(str)
+    rows["cell_id"] = rows["source_split_cell_id"].map(canonical_rna_cell_id)
+    if rows["cell_id"].duplicated().any():
+        raise ValueError("cell split contains duplicate canonical cell_id values")
+    allowed = {"train", "val", "test"}
+    observed = set(rows["split"].astype(str))
+    if observed != allowed:
+        raise ValueError(
+            f"cell split labels differ from {sorted(allowed)}: {sorted(observed)}"
+        )
+    return rows
 
 
 @dataclass(frozen=True)
@@ -40,11 +66,17 @@ class GeneGraph:
     path_edges: pd.DataFrame
     edge_ids: tuple[str, ...]
     path_ids: tuple[str, ...]
+    transcript_aliases: tuple[tuple[str, ...], ...]
     path_edge_rows: tuple[tuple[int, ...], ...]
     path_node_rows: tuple[tuple[str, ...], ...]
+    path_first_edge_indices: tuple[int, ...]
+    path_last_edge_indices: tuple[int, ...]
+    path_log_edge_count: tuple[float, ...]
     path_edge_incidence: sparse.csr_matrix
     local_edge_index: np.ndarray
     edge_features: np.ndarray
+    variable_edge_count: int
+    centered_path_incidence_energy: float
 
 
 def load_graph_tables(
@@ -186,6 +218,16 @@ def build_gene_graph(
     _require_unique(nodes, "node_id", "node")
     _require_unique(edges, "edge_id", "edge")
     _require_unique(paths, "path_id", "path")
+    _require_unique(paths, "transcript_id", "transcript")
+    declared_path_ids = set(paths["path_id"].astype(str))
+    observed_path_edge_ids = set(path_edges["path_id"].astype(str))
+    if observed_path_edge_ids != declared_path_ids:
+        missing = sorted(declared_path_ids - observed_path_edge_ids)
+        extra = sorted(observed_path_edge_ids - declared_path_ids)
+        raise ValueError(
+            "path and path-edge table identities differ: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
     if not set(nodes["node_type"].astype(str)).issubset(IMPORTED_NODE_TYPES):
         raise ValueError(f"gene {gene_id} contains an unknown imported node type")
     if not set(edges["edge_type"].astype(str)).issubset(IMPORTED_EDGE_TYPES):
@@ -245,7 +287,29 @@ def build_gene_graph(
         unknown = sorted(set(ids) - set(imported_edges.index))
         if unknown:
             raise ValueError(f"path {path_id} references unknown edges: {unknown[:5]}")
+        if set(ordered["transcript_id"].astype(str)) != {
+            str(path["transcript_id"])
+        }:
+            raise ValueError(
+                f"path {path_id} transcript identity differs between path tables"
+            )
+        if set(ordered["chrom"].astype(str)) != {str(path["chrom"])} or set(
+            ordered["strand"].astype(str)
+        ) != {str(path["strand"])}:
+            raise ValueError(
+                f"path {path_id} chromosome/strand differs between path tables"
+            )
         selected = imported_edges.loc[ids]
+        if not ordered["edge_type"].astype(str).reset_index(drop=True).equals(
+            selected["edge_type"].astype(str).reset_index(drop=True)
+        ) or not ordered["chrom"].astype(str).reset_index(drop=True).equals(
+            selected["chrom"].astype(str).reset_index(drop=True)
+        ) or not ordered["strand"].astype(str).reset_index(drop=True).equals(
+            selected["strand"].astype(str).reset_index(drop=True)
+        ):
+            raise ValueError(
+                f"path {path_id} edge type/chromosome/strand differs from edge table"
+            )
         if not ordered["src_node_id"].astype(str).reset_index(drop=True).equals(
             selected["src_node_id"].astype(str).reset_index(drop=True)
         ) or not ordered["dst_node_id"].astype(str).reset_index(drop=True).equals(
@@ -265,6 +329,24 @@ def build_gene_graph(
     path_edges = path_edges.loc[processing].copy()
     if path_edges.empty:
         raise ValueError(f"gene {gene_id} has no processing path edges")
+    processing_groups = {
+        str(key): value.sort_values("edge_order", kind="mergesort")
+        for key, value in path_edges.groupby("path_id", sort=False)
+    }
+    for path in paths.itertuples(index=False):
+        path_id = str(path.path_id)
+        ordered = processing_groups.get(path_id)
+        if ordered is None or ordered.empty:
+            raise ValueError(f"path {path_id} has no processing path edges")
+        if str(ordered.iloc[0]["src_node_id"]) != str(path.tss_node_id):
+            raise ValueError(
+                f"path {path_id} does not start at its declared TSS before collapse"
+            )
+        if str(ordered.iloc[-1]["dst_node_id"]) != str(path.pas_node_id):
+            raise ValueError(
+                f"path {path_id} does not end at its declared PAS before collapse"
+            )
+    paths, path_edges = _collapse_identical_structural_paths(paths, path_edges)
     counts = path_edges.groupby("path_id", sort=False).size()
     if set(counts.index.astype(str)) != set(paths["path_id"].astype(str)):
         raise ValueError(f"gene {gene_id} has a legal path with no processing edges")
@@ -318,6 +400,10 @@ def build_gene_graph(
 
     edge_ids = tuple(edges["edge_id"].astype(str))
     path_ids = tuple(paths["path_id"].astype(str))
+    transcript_aliases = tuple(
+        tuple(str(value) for value in aliases)
+        for aliases in paths["transcript_aliases"]
+    )
     edge_index = {value: index for index, value in enumerate(edge_ids)}
     edge_by_id = edges.set_index(edges["edge_id"].astype(str), drop=False)
     grouped = {
@@ -390,6 +476,13 @@ def build_gene_graph(
         if local_pairs
         else np.empty((2, 0), dtype=np.int64)
     )
+    catalog_incidence_mean = np.asarray(incidence.mean(axis=0)).reshape(-1)
+    variable_edge_count = int(
+        ((catalog_incidence_mean > 0.0) & (catalog_incidence_mean < 1.0)).sum()
+    )
+    centered_path_incidence_energy = float(
+        np.sum(catalog_incidence_mean * (1.0 - catalog_incidence_mean))
+    )
     return GeneGraph(
         gene_id=gene_id,
         nodes=nodes,
@@ -398,11 +491,17 @@ def build_gene_graph(
         path_edges=path_edges,
         edge_ids=edge_ids,
         path_ids=path_ids,
+        transcript_aliases=transcript_aliases,
         path_edge_rows=tuple(path_edge_rows),
         path_node_rows=tuple(path_node_rows),
+        path_first_edge_indices=tuple(row[0] for row in path_edge_rows),
+        path_last_edge_indices=tuple(row[-1] for row in path_edge_rows),
+        path_log_edge_count=tuple(float(np.log1p(len(row))) for row in path_edge_rows),
         path_edge_incidence=incidence,
         local_edge_index=local_edge_index,
         edge_features=edge_feature_matrix(edges),
+        variable_edge_count=variable_edge_count,
+        centered_path_incidence_energy=centered_path_incidence_energy,
     )
 
 
@@ -431,6 +530,76 @@ def edge_feature_matrix(edges: pd.DataFrame) -> np.ndarray:
     if not np.isfinite(result).all():
         raise ValueError("fixed edge feature matrix contains non-finite values")
     return result
+
+
+def _collapse_identical_structural_paths(
+    paths: pd.DataFrame, path_edges: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Collapse duplicate ordered edge sequences and retain transcript aliases.
+
+    The legal candidate axis is structural.  Transcript annotations with the
+    same ordered processing-edge sequence therefore contribute one softmax
+    entry, while every original transcript ID remains attached to that entry
+    for reporting and crosswalk validation.
+    """
+
+    grouped = {
+        str(path_id): group.sort_values("edge_order", kind="mergesort")
+        for path_id, group in path_edges.groupby("path_id", sort=False)
+    }
+    path_rows = {
+        str(row.path_id): row
+        for row in paths.itertuples(index=False)
+    }
+    sequence_groups: dict[tuple[str, ...], list[str]] = {}
+    for path_id in paths["path_id"].astype(str):
+        ordered = grouped.get(path_id)
+        if ordered is None:
+            raise ValueError(f"path {path_id} has no processing edge rows")
+        sequence = tuple(ordered["edge_id"].astype(str))
+        sequence_groups.setdefault(sequence, []).append(path_id)
+
+    collapsed_paths: list[dict[str, object]] = []
+    collapsed_path_edges: list[pd.DataFrame] = []
+    for sequence, source_path_ids in sequence_groups.items():
+        canonical_path_id = min(source_path_ids)
+        canonical = paths.loc[
+            paths["path_id"].astype(str) == canonical_path_id
+        ].iloc[0].to_dict()
+        source_transcripts = [
+            getattr(path_rows[path_id], "transcript_id")
+            for path_id in source_path_ids
+        ]
+        if any(pd.isna(value) for value in source_transcripts):
+            raise ValueError("structural path transcript aliases cannot be missing")
+        aliases = sorted({str(value) for value in source_transcripts})
+        if not aliases or any(not alias for alias in aliases):
+            raise ValueError("structural path transcript aliases must be non-empty")
+        source_path_rows = paths.loc[
+            paths["path_id"].astype(str).isin(source_path_ids)
+        ]
+        if source_path_rows["path_length_bp"].nunique(dropna=False) != 1:
+            raise ValueError(
+                "identical structural paths disagree on declared path_length_bp"
+            )
+        canonical["path_id"] = canonical_path_id
+        canonical["transcript_id"] = aliases[0]
+        canonical["transcript_aliases"] = aliases
+        canonical["source_path_ids"] = sorted(source_path_ids)
+        collapsed_paths.append(canonical)
+
+        ordered = grouped[canonical_path_id].copy()
+        ordered["path_id"] = canonical_path_id
+        ordered["transcript_id"] = aliases[0]
+        if tuple(ordered["edge_id"].astype(str)) != sequence:
+            raise AssertionError("canonical structural path sequence changed")
+        collapsed_path_edges.append(ordered)
+
+    result_paths = pd.DataFrame(collapsed_paths).reset_index(drop=True)
+    result_edges = pd.concat(collapsed_path_edges, ignore_index=True)
+    if result_paths["path_id"].astype(str).duplicated().any():
+        raise AssertionError("collapsed structural path IDs are not unique")
+    return result_paths, result_edges
 
 
 def load_compatibility_rows(

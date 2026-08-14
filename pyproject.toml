@@ -5,16 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fabric-isoform"
 version = "0.1.0"
-description = "FABRIC V1: factor-aware regulation of compatible isoform paths"
+description = "FABRIC V2: event-routed regulation of compatible structural isoform paths"
 requires-python = ">=3.11"
 dependencies = [
   "anndata>=0.12",
   "h5py>=3.11",
   "hdf5plugin>=5.0",
+  "MOODS-python>=1.9.4.1",
   "numpy>=1.26",
   "pandas>=2.2",
   "pyarrow>=16",
   "pyfaidx>=0.9",
+  "pysam>=0.23",
   "PyYAML>=6",
   "scikit-learn>=1.5",
   "scipy>=1.13",
@@ -26,6 +28,8 @@ dependencies = [
 test = ["pytest>=7.4"]
 
 [project.scripts]
+fabric-build-compatible-ec = "fabric.compatibility_artifact:main"
+fabric-build-ont-validation-kl = "fabric.ont_validation:main"
 fabric-train = "fabric.train:main"
 
 [tool.setuptools.packages.find]
