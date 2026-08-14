@@ -36,9 +36,9 @@ sources:
   rna_motif_gene_map: /home2/xyf/project/PRISM/data/motifs/cisbp_rna_human_motif_gene_map.tsv
 
 derived:
-  rna_atac_neighbors: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/cell_context/rna_atac_neighbors.parquet
-  ont_validation_kl_target: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/ont_validation_kl_target
-  real_dataset: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1
+  rna_atac_neighbors: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/cell_context/rna_atac_neighbors.parquet
+  ont_validation_kl_target: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ont_validation_kl_target
+  real_dataset: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1
 
 expected:
   structural_candidate_gene_count: 17706

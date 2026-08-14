@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from fabric.dataset import build_event_feature_manifest
 from fabric.motifs import EVENT_ROUTE_COLUMNS, PHYSICAL_EVENT_COLUMNS
@@ -8,11 +10,21 @@ from fabric.real_prepared import (
     _ExactRectangleBasis,
     _encode_candidate_base,
     _joined_route_context,
+    _prepared_artifact_identities,
     _select_full_rank_base,
     _select_exact_integer_columns,
     _supported_bipartite_cycle_space_dimension,
     _base_candidate_specs,
 )
+
+
+def test_artifact_directory_names_are_stable_prepared_identities():
+    real_root = Path("data/processed/fabric_v2_real_dataset_atomic_introns_v1")
+    compatible_root = Path("data/processed/fabric_v2_compatible_ec_v1")
+    assert _prepared_artifact_identities(real_root, compatible_root) == (
+        "fabric_v2_real_dataset_atomic_introns_v1",
+        "fabric_v2_compatible_ec_v1",
+    )
 
 
 def _catalog():

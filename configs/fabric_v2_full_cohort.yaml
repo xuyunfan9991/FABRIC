@@ -8,7 +8,7 @@ execution:
 
 inputs:
   frozen: true
-  input_manifest_id: fabric_v2_real_dataset_v1
+  input_manifest_id: fabric_v2_real_dataset_atomic_introns_v1
   compatibility_artifact_id: fabric_v2_compatible_ec_v1
   structural_candidate_count: 17706
   g_fit_gene_count: 17600
@@ -58,15 +58,15 @@ monitor:
   sealed: true
   metric: ont_matrix_kl_count_weighted
   scope_policy: likelihood_informative_validation_cell_gene_with_at_least_two_positive_ont_paths
-  target_root: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/ont_validation_kl_target
+  target_root: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ont_validation_kl_target
 
 resources:
   frozen: true
   profile_status: FROZEN_REAL_FULL_SHAPE_PROFILE
   validation_status: FROZEN_STRICT_REAL_VALIDATION
-  profile_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/ResourceProfile.json
-  validation_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/ValidationReport.json
-  adaptive_batch_audit: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_v1/AdaptiveBatchAudit.json
+  profile_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ResourceProfile.json
+  validation_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ValidationReport.json
+  adaptive_batch_audit: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/AdaptiveBatchAudit.json
   batch_policy: gene_shape_adaptive_v1
   compute_precision: float32_highest
   prefetch_backed_gene_shards: true
@@ -79,16 +79,8 @@ resources:
   gpu_count: 1
   gpu_model: NVIDIA GeForce RTX 4090
   gpu_total_memory_bytes: 25386352640
-  profiled_peak_gpu_allocated_bytes: 10081855488
   frozen_host_ram_requirement_bytes: 34359738368
-  real_dataset_storage_bytes: 976053070517
-  prepared_runtime_storage_bytes: 62108503015
-  compatible_ec_storage_bytes: 22460797442
-  projected_hours_per_epoch: 3.1979962237669315
-  projected_hours_through_first_patience_stop: 19.187977342601588
-  projected_max_hours: 95.93988671300795
   rerun_reserve_fraction: 0.10
-  projected_max_gpu_hours_with_rerun_reserve: 105.53387538430876
 
 deferred_cis_extension:
   enabled: false
