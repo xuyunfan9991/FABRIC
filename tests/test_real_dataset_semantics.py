@@ -5,9 +5,12 @@ import pandas as pd
 import pytest
 
 from fabric.real_dataset import (
+    _admissible_atac_neighbors,
     _cis_sequence_scores,
+    _is_jaspar_heterodimer,
     _ordered_peak_interval_arrays,
     _revcomp,
+    _write_source_validation,
 )
 
 
@@ -78,3 +81,82 @@ def test_peak_query_contract_rejects_nonmonotone_interval_ends():
     nested = valid.assign(end=[100, 20])
     with pytest.raises(ValueError, match="monotone starts and ends"):
         _ordered_peak_interval_arrays(nested)
+
+
+def test_cis_clipped_site_window_is_unavailable_not_observed_zero(tmp_path):
+    fasta = tmp_path / "boundary.fa"
+    fasta.write_text(">chr1\n" + "ACGT" * 30 + "\n")
+    nodes = pd.DataFrame(
+        {
+            "node_id": ["donor", "acceptor"],
+            "node_type": ["donor", "acceptor"],
+            "pos_0based": [2, 50],
+        }
+    )
+    edges = pd.DataFrame(
+        {
+            "edge_id": ["edge"],
+            "src_node_id": ["donor"],
+            "dst_node_id": ["acceptor"],
+            "chrom": ["chr1"],
+            "strand": ["+"],
+            "start_0based": [2],
+            "end_0based_exclusive": [50],
+        }
+    )
+    score = _cis_sequence_scores(edges, nodes, fasta).iloc[0]
+    assert not bool(score.donor_strength_available)
+    assert score.donor_strength == 0.0
+    assert bool(score.acceptor_strength_available)
+
+    clipped_edge = edges.assign(start_0based=-1)
+    with pytest.raises(ValueError, match="edge interval crosses"):
+        _cis_sequence_scores(clipped_edge, nodes, fasta)
+
+
+def test_atac_neighbors_are_filtered_before_weight_normalization():
+    distances, indices, weights = _admissible_atac_neighbors(
+        np.asarray([0.4, 0.8, 1.2, 2.0]),
+        np.asarray([10, 11, 12, 13]),
+        maximum_distance=1.0,
+        temperature=0.5,
+    )
+    np.testing.assert_allclose(distances, [0.4, 0.8])
+    np.testing.assert_array_equal(indices, [10, 11])
+    assert weights.sum() == pytest.approx(1.0)
+    assert len(weights) == 2
+
+
+def test_jaspar_double_colon_names_are_unmodeled_heterodimers():
+    assert _is_jaspar_heterodimer("Pou5f1::Sox2")
+    assert not _is_jaspar_heterodimer("CEBPG(var.2)")
+
+
+def test_real_build_identity_is_immutable_within_one_output_root(
+    tmp_path, monkeypatch
+):
+    class Result:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def fake_run(command, **_kwargs):
+        return Result("" if "status" in command else "source-commit\n")
+
+    monkeypatch.setattr("fabric.real_dataset.subprocess.run", fake_run)
+    output = tmp_path / "fresh"
+    paths = {"real_dataset": output, "reference": tmp_path / "reference.fa"}
+    _write_source_validation(paths, output)
+    identity_path = output / "SourceValidation.json"
+    first = identity_path.read_text()
+    _write_source_validation(paths, output)
+    assert identity_path.read_text() == first
+
+    changed = {**paths, "reference": tmp_path / "other.fa"}
+    with pytest.raises(RuntimeError, match="fresh output root"):
+        _write_source_validation(changed, output)
+
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "old.parquet").touch()
+    with pytest.raises(RuntimeError, match="lacks a current build identity"):
+        _write_source_validation({**paths, "real_dataset": legacy}, legacy)

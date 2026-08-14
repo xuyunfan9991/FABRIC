@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import random
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
@@ -181,6 +182,7 @@ class BackedPreparedDataset:
     input_manifest_id: str
     compatibility_artifact_id: str
     informative_gene_ids: tuple[str, ...]
+    source_git_commit: str | None = None
 
     @classmethod
     def load(cls, root: str | Path) -> "BackedPreparedDataset":
@@ -215,6 +217,11 @@ class BackedPreparedDataset:
             input_manifest_id=str(manifest["input_manifest_id"]),
             compatibility_artifact_id=str(manifest["compatibility_artifact_id"]),
             informative_gene_ids=axis,
+            source_git_commit=(
+                None
+                if manifest.get("source_git_commit") is None
+                else str(manifest["source_git_commit"])
+            ),
         )
 
 
@@ -3659,6 +3666,17 @@ def _training_recovery_identity(
     else:
         ordered_gene_ids = tuple(gene.gene_id for gene in genes)
         dataset_kind = "prepared_dataset" if prepared is not None else "sequence"
+    source_commit = _runtime_source_commit(
+        require_clean=config["execution"]["scope"] == FULL_COHORT_SCOPE
+    )
+    if (
+        config["execution"]["scope"] == FULL_COHORT_SCOPE
+        and isinstance(prepared, BackedPreparedDataset)
+        and prepared.source_git_commit != source_commit
+    ):
+        raise RuntimeError(
+            "full-cohort prepared artifact source commit differs from the training source"
+        )
     return {
         "training_run_manifest": asdict(manifest),
         "resolved_config": copy.deepcopy(dict(config)),
@@ -3669,11 +3687,31 @@ def _training_recovery_identity(
         "compatibility_artifact_id": (
             prepared.compatibility_artifact_id if prepared is not None else None
         ),
+        "source_git_commit": source_commit,
         "ordered_gene_ids": ordered_gene_ids,
         "model_spec": _model_spec(genes[0], config["model"]),
         "readout_kind": "path_context",
         "test_model_predictions_status": "NOT_COMPUTED_DURING_TRAINING",
     }
+
+
+def _runtime_source_commit(*, require_clean: bool) -> str:
+    repository = Path(__file__).resolve().parents[2]
+    if require_clean:
+        status = subprocess.run(
+            ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if status:
+            raise RuntimeError("full-cohort training requires a committed src/fabric source tree")
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _write_initial_run_identity(

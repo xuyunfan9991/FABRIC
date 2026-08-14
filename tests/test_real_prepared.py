@@ -9,7 +9,7 @@ from fabric.real_prepared import (
     _encode_candidate_base,
     _joined_route_context,
     _select_full_rank_base,
-    _select_gf2_independent_columns,
+    _select_exact_integer_columns,
     _supported_bipartite_cycle_space_dimension,
     _base_candidate_specs,
 )
@@ -87,16 +87,37 @@ def test_supported_cycle_bound_is_exact_but_does_not_invent_rectangles():
     ) == 1
 
 
-def test_combined_gf2_closure_keeps_base_and_canonical_independent_columns():
+def test_combined_exact_closure_keeps_base_and_canonical_independent_columns():
     # Rows span columns 0, 1 and 3; candidate column 2 duplicates the required
     # base column 0 and must close before candidate column 3 is retained.
-    retained, rank = _select_gf2_independent_columns(
-        (0b0101, 0b0010, 0b1000),
+    retained, rank = _select_exact_integer_columns(
+        (
+            ((0, 1), (2, 1)),
+            ((1, 1),),
+            ((3, 1),),
+        ),
         width=4,
         required_prefix_width=2,
     )
     assert retained == (0, 1, 3)
     assert rank == 3
+
+
+def test_signed_rectangle_is_not_dropped_by_unsigned_mod2_alias():
+    # The signed rectangle is independent over Q even though reducing +/-1
+    # modulo two makes it equal to factor_A + factor_B.
+    retained, rank = _select_exact_integer_columns(
+        (
+            ((0, 1), (3, 1)),
+            ((0, 1), (2, 1), (3, -1)),
+            ((1, 1), (3, -1)),
+            ((1, 1), (2, 1), (3, 1)),
+        ),
+        width=4,
+        required_prefix_width=3,
+    )
+    assert retained == (0, 1, 2, 3)
+    assert rank == 4
 
 
 def test_streamed_base_rank_closure_keeps_complete_active_factor_baseline():

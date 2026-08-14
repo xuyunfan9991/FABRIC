@@ -372,6 +372,49 @@ def test_real_graph_compiler_preserves_frozen_path_order_and_retained_intron(str
     assert tables.edges["edge_id"].is_unique
 
 
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_real_graph_compiler_rejects_overlapping_retained_intron_components(strand):
+    rows = pd.DataFrame(
+        [
+            {
+                "gene_id": "ENSG_OVERLAP",
+                "path_id": "splice_a",
+                "resolved_transcript_id": "splice_a",
+                "path_order_0based": 0,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [100, 220],
+                "exon_ends_0based_exclusive": [150, 300],
+                "transcript_aliases": ["splice_a"],
+            },
+            {
+                "gene_id": "ENSG_OVERLAP",
+                "path_id": "splice_b",
+                "resolved_transcript_id": "splice_b",
+                "path_order_0based": 1,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [100, 250],
+                "exon_ends_0based_exclusive": [180, 300],
+                "transcript_aliases": ["splice_b"],
+            },
+            {
+                "gene_id": "ENSG_OVERLAP",
+                "path_id": "retained",
+                "resolved_transcript_id": "retained",
+                "path_order_0based": 2,
+                "chrom": "chr1",
+                "strand": strand,
+                "exon_starts_0based": [90],
+                "exon_ends_0based_exclusive": [310],
+                "transcript_aliases": ["retained"],
+            },
+        ]
+    )
+    with pytest.raises(ValueError, match="unresolved overlapping-intron component"):
+        compile_gene_graph_tables(rows)
+
+
 def test_backed_prepared_dataset_loads_only_requested_gene_shard(tmp_path):
     first = make_toy_genes()[0]
     genes = (first, replace(first, gene_id="TOY_GENE_PREFETCH_SECOND"))

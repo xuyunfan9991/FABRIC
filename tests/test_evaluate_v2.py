@@ -24,6 +24,7 @@ from fabric.evaluate import (
     build_pairing_permutation_assignments,
     build_event_density_token_audit,
     build_path_scale_audit,
+    classify_model_injection_coverage,
     compute_compatible_score_residuals,
     compute_compatible_set_diagnostics,
     compute_ont_matrix_agreement,
@@ -83,6 +84,13 @@ def _event_tables():
         }
     )
     return events, routes, injection, correlated
+
+
+def test_missing_model_injection_index_fails_closed_for_primary_attribution():
+    complete, partial, scope = classify_model_injection_coverage(("r1",), None)
+    assert complete == ()
+    assert partial == ()
+    assert scope == "not_evaluated_missing_index"
 
 
 def test_primitive_and_derived_selectors_resolve_exact_route_unions():
