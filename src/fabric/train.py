@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import copy
+import fcntl
 import json
+import os
 import random
 import sys
 from dataclasses import asdict, dataclass, field, replace
@@ -1372,6 +1375,7 @@ class OptimizerGridSelection:
 EpochMonitor = Callable[
     [str, int, ValidationSnapshot], Mapping[str, float | int | str | bool]
 ]
+EpochCheckpoint = Callable[[Mapping[str, object]], None]
 
 
 def _validate_optional_optimizer_selection_metadata(
@@ -2362,8 +2366,9 @@ def train_run(
     device: str | torch.device,
     run_dir: str | Path | None = None,
     monitor_callback: EpochMonitor | None = None,
+    resume_from: str | Path | None = None,
 ) -> TrainingRunResult:
-    """Train one independently selected seed and modality condition."""
+    """Train one seed/condition, optionally resuming after a completed epoch."""
 
     manifest = training_manifest_from_config(config, seed=seed, condition=condition)
     assert_execution_admitted(config)
@@ -2405,38 +2410,102 @@ def train_run(
             raise RuntimeError(
                 "runtime GPU is shared or lacks the frozen adaptive-batch target memory"
             )
-    _seed_everything(seed)
-    model = FABRICV2Model(
-        **_model_spec(genes[0], config["model"]), readout_kind="path_context"
-    ).to(torch_device)
-    result = _fit_condition(
-        genes,
-        model,
-        forward_condition=_MODEL_CONDITION[condition],
-        condition_name=condition,
-        seed=seed,
-        config=config,
-        monitor_callback=monitor_callback,
-    )
-    metric_rows = [
-        {
-            "seed": seed,
-            "condition": condition,
-            "split": "val",
-            "validation_compatible_path_nll": result.best_validation_nll,
-            "ont_matrix_kl_count_weighted": (result.best_ont_matrix_kl_count_weighted),
-            "informative_molecule_mass": (result.validation_informative_molecule_mass),
-            "execution_scope": config["execution"]["scope"],
-        }
-    ]
-    run = TrainingRunResult(
-        manifest=manifest,
-        result=result,
-        metrics=pd.DataFrame(metric_rows),
-    )
-    if run_dir is not None:
-        _write_run(run, config, Path(run_dir), genes, prepared)
-    return run
+    if resume_from is not None and run_dir is None:
+        raise ValueError("resume_from requires the original run_dir")
+    run_path = Path(run_dir) if run_dir is not None else None
+    resume_path = Path(resume_from) if resume_from is not None else None
+    if run_path is not None:
+        if resume_path is None:
+            run_path.mkdir(parents=True, exist_ok=False)
+        elif not run_path.is_dir():
+            raise FileNotFoundError(
+                "resume requires the existing original run directory: "
+                f"{run_path}"
+            )
+
+    lock = _exclusive_run_lock(run_path) if run_path is not None else nullcontext()
+    with lock:
+        _seed_everything(seed)
+        model = FABRICV2Model(
+            **_model_spec(genes[0], config["model"]), readout_kind="path_context"
+        ).to(torch_device)
+        recovery_identity = _training_recovery_identity(
+            manifest=manifest,
+            config=config,
+            genes=genes,
+            prepared=prepared,
+        )
+        resume_checkpoint: Mapping[str, object] | None = None
+        if run_path is not None:
+            if resume_path is None:
+                _write_initial_run_identity(run_path, manifest, config)
+            else:
+                expected_latest = run_path / "latest.pt"
+                if resume_path.resolve() != expected_latest.resolve():
+                    raise ValueError(
+                        "resume_from must be the original run_dir/latest.pt; "
+                        "best checkpoints cannot continue an epoch history"
+                    )
+                _validate_stored_run_identity(run_path, manifest, config)
+                resume_checkpoint = _load_training_recovery_checkpoint(
+                    resume_path, expected_identity=recovery_identity
+                )
+
+        checkpoint_callback = (
+            None
+            if run_path is None
+            else partial(
+                _persist_epoch_recovery,
+                run_dir=run_path,
+                run_identity=recovery_identity,
+            )
+        )
+        result = _fit_condition(
+            genes,
+            model,
+            forward_condition=_MODEL_CONDITION[condition],
+            condition_name=condition,
+            seed=seed,
+            config=config,
+            monitor_callback=monitor_callback,
+            resume_checkpoint=resume_checkpoint,
+            epoch_checkpoint_callback=checkpoint_callback,
+            resume_validated_callback=(
+                None
+                if run_path is None
+                else partial(_reconcile_recovery_artifacts, run_path)
+            ),
+        )
+        metric_rows = [
+            {
+                "seed": seed,
+                "condition": condition,
+                "split": "val",
+                "validation_compatible_path_nll": result.best_validation_nll,
+                "ont_matrix_kl_count_weighted": (
+                    result.best_ont_matrix_kl_count_weighted
+                ),
+                "informative_molecule_mass": (
+                    result.validation_informative_molecule_mass
+                ),
+                "execution_scope": config["execution"]["scope"],
+            }
+        ]
+        run = TrainingRunResult(
+            manifest=manifest,
+            result=result,
+            metrics=pd.DataFrame(metric_rows),
+        )
+        if run_path is not None:
+            _write_run(
+                run,
+                config,
+                run_path,
+                genes,
+                prepared,
+                recovery_identity=recovery_identity,
+            )
+        return run
 
 
 def sample_train_gene_cells_for_epoch(
@@ -2508,6 +2577,9 @@ def _fit_condition(
     seed: int,
     config: Mapping[str, object],
     monitor_callback: EpochMonitor | None,
+    resume_checkpoint: Mapping[str, object] | None = None,
+    epoch_checkpoint_callback: EpochCheckpoint | None = None,
+    resume_validated_callback: EpochCheckpoint | None = None,
 ) -> ConditionResult:
     training = config["training"]
     optimizer_config = config["optimizer"]
@@ -2540,8 +2612,38 @@ def _fit_condition(
     best_lr_scheduler_state: dict[str, object] | None = None
     best_ont_matrix_kl: float | None = None
     epochs_without_improvement = 0
+    completed_epoch = 0
 
-    for epoch in range(1, max_epochs + 1):
+    if resume_checkpoint is not None:
+        restored = _restore_fit_checkpoint(
+            resume_checkpoint,
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            seed=seed,
+            condition_name=condition_name,
+            max_epochs=max_epochs,
+            patience=patience,
+            monitor_enabled=monitor_callback is not None,
+        )
+        completed_epoch = restored["completed_epoch"]
+        history_rows = restored["history_rows"]
+        monitor_records = restored["monitor_records"]
+        best_nll = restored["best_nll"]
+        best_epoch = restored["best_epoch"]
+        best_state = restored["best_state"]
+        best_optimizer_state = restored["best_optimizer_state"]
+        best_lr_scheduler_state = restored["best_lr_scheduler_state"]
+        best_ont_matrix_kl = restored["best_ont_matrix_kl"]
+        epochs_without_improvement = restored["epochs_without_improvement"]
+        rng.setstate(resume_checkpoint["gene_order_rng_state"])
+        _restore_rng_state(resume_checkpoint["global_rng_state"])
+        if resume_validated_callback is not None:
+            resume_validated_callback(resume_checkpoint)
+
+    for epoch in range(completed_epoch + 1, max_epochs + 1):
+        if epochs_without_improvement >= patience:
+            break
         epoch_learning_rate = _optimizer_learning_rate(optimizer)
         model.train()
         order = list(range(len(genes)))
@@ -2676,14 +2778,15 @@ def _fit_condition(
         if lr_scheduler is not None:
             lr_scheduler.step(val_nll)
         next_epoch_learning_rate = _optimizer_learning_rate(optimizer)
-        if val_nll < best_nll:
+        best_improved = val_nll < best_nll
+        if best_improved:
             best_nll = val_nll
             best_ont_matrix_kl = ont_matrix_kl
             best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
-            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            best_state = _cpu_copy(model.state_dict())
+            best_optimizer_state = _cpu_copy(optimizer.state_dict())
             best_lr_scheduler_state = (
-                copy.deepcopy(lr_scheduler.state_dict())
+                _cpu_copy(lr_scheduler.state_dict())
                 if lr_scheduler is not None
                 else None
             )
@@ -2721,6 +2824,41 @@ def _fit_condition(
                 "uniform_gene_step_objective_multiplier": (train_positive_gene_count),
             }
         )
+
+        if epoch_checkpoint_callback is not None:
+            if best_state is None or best_optimizer_state is None:
+                raise RuntimeError("completed epoch has no selected checkpoint")
+            epoch_checkpoint_callback(
+                {
+                    "completed_epoch": epoch,
+                    "model_state_dict": _cpu_copy(model.state_dict()),
+                    "optimizer_state_dict": _cpu_copy(optimizer.state_dict()),
+                    "lr_scheduler_state_dict": (
+                        _cpu_copy(lr_scheduler.state_dict())
+                        if lr_scheduler is not None
+                        else None
+                    ),
+                    "best_epoch": best_epoch,
+                    "best_validation_nll": best_nll,
+                    "best_ont_matrix_kl_count_weighted": best_ont_matrix_kl,
+                    "best_model_state_dict": best_state,
+                    "best_optimizer_state_dict": best_optimizer_state,
+                    "best_lr_scheduler_state_dict": best_lr_scheduler_state,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "history_rows": copy.deepcopy(history_rows),
+                    "monitor_records": [
+                        asdict(record) for record in monitor_records
+                    ],
+                    "gene_order_rng_state": rng.getstate(),
+                    "global_rng_state": _capture_rng_state(),
+                    "training_complete": (
+                        epoch >= max_epochs
+                        or epochs_without_improvement >= patience
+                    ),
+                    "best_improved_this_epoch": best_improved,
+                    "held_out_test_evaluated": False,
+                }
+            )
 
         if epochs_without_improvement >= patience:
             break
@@ -3463,23 +3601,391 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _cpu_copy(value: object) -> object:
+    """Clone checkpoint state onto CPU without retaining extra GPU allocations."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {key: _cpu_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_cpu_copy(item) for item in value)
+    if isinstance(value, list):
+        return [_cpu_copy(item) for item in value]
+    return copy.deepcopy(value)
+
+
+@contextmanager
+def _exclusive_run_lock(run_dir: Path):
+    """Prevent two trainers from mutating the same recovery history."""
+
+    lock_path = run_dir / ".training.lock"
+    handle = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"another training process holds the run directory: {run_dir}"
+            ) from error
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(value)
+    os.replace(temporary, path)
+
+
+def _atomic_torch_save(value: object, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def _training_recovery_identity(
+    *,
+    manifest: TrainingRunManifest,
+    config: Mapping[str, object],
+    genes: Sequence[PreparedGene],
+    prepared: PreparedDataset | BackedPreparedDataset | None,
+) -> dict[str, object]:
+    if isinstance(genes, BackedGeneSequence):
+        ordered_gene_ids = tuple(gene_id for gene_id, _ in genes.records)
+        dataset_kind = "backed_prepared_dataset"
+    else:
+        ordered_gene_ids = tuple(gene.gene_id for gene in genes)
+        dataset_kind = "prepared_dataset" if prepared is not None else "sequence"
+    return {
+        "training_run_manifest": asdict(manifest),
+        "resolved_config": copy.deepcopy(dict(config)),
+        "dataset_kind": dataset_kind,
+        "input_manifest_id": (
+            prepared.input_manifest_id if prepared is not None else None
+        ),
+        "compatibility_artifact_id": (
+            prepared.compatibility_artifact_id if prepared is not None else None
+        ),
+        "ordered_gene_ids": ordered_gene_ids,
+        "model_spec": _model_spec(genes[0], config["model"]),
+        "readout_kind": "path_context",
+        "test_model_predictions_status": "NOT_COMPUTED_DURING_TRAINING",
+    }
+
+
+def _write_initial_run_identity(
+    run_dir: Path,
+    manifest: TrainingRunManifest,
+    config: Mapping[str, object],
+) -> None:
+    _atomic_write_text(
+        run_dir / "config.yaml", yaml.safe_dump(dict(config), sort_keys=False)
+    )
+    _atomic_write_text(
+        run_dir / "training_run_manifest.json",
+        json.dumps(asdict(manifest), indent=2, sort_keys=True),
+    )
+
+
+def _validate_stored_run_identity(
+    run_dir: Path,
+    manifest: TrainingRunManifest,
+    config: Mapping[str, object],
+) -> None:
+    config_path = run_dir / "config.yaml"
+    manifest_path = run_dir / "training_run_manifest.json"
+    if not config_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(
+            "resume run directory lacks config.yaml or training_run_manifest.json"
+        )
+    stored_config = yaml.safe_load(config_path.read_text())
+    if stored_config != dict(config):
+        raise ValueError("resume resolved config differs from the original run")
+    stored_manifest = json.loads(manifest_path.read_text())
+    if stored_manifest != asdict(manifest):
+        raise ValueError("resume training manifest differs from the original run")
+
+
+def _load_training_recovery_checkpoint(
+    path: Path,
+    *,
+    expected_identity: Mapping[str, object],
+) -> Mapping[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError(f"resume checkpoint does not exist: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("resume checkpoint must be a mapping")
+    if checkpoint.get("schema_version") != "fabric.training_recovery_checkpoint.v1":
+        raise ValueError("unsupported FABRIC training recovery checkpoint")
+    observed_identity = checkpoint.get("run_identity")
+    if not isinstance(observed_identity, Mapping):
+        raise TypeError("resume checkpoint lacks a run identity")
+    for identity_field, expected in expected_identity.items():
+        if observed_identity.get(identity_field) != expected:
+            raise ValueError(
+                f"resume checkpoint {identity_field} identity differs"
+            )
+    required = {
+        "completed_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "lr_scheduler_state_dict",
+        "best_epoch",
+        "best_validation_nll",
+        "best_ont_matrix_kl_count_weighted",
+        "best_model_state_dict",
+        "best_optimizer_state_dict",
+        "best_lr_scheduler_state_dict",
+        "epochs_without_improvement",
+        "history_rows",
+        "monitor_records",
+        "gene_order_rng_state",
+        "global_rng_state",
+        "training_complete",
+        "held_out_test_evaluated",
+    }
+    missing = required - set(checkpoint)
+    if missing:
+        raise ValueError(f"resume checkpoint fields are missing: {sorted(missing)}")
+    if checkpoint["held_out_test_evaluated"] is not False:
+        raise RuntimeError("training recovery checkpoint cannot contain test exposure")
+    return checkpoint
+
+
+def _restore_fit_checkpoint(
+    checkpoint: Mapping[str, object],
+    *,
+    model: FABRICV2Model,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    seed: int,
+    condition_name: str,
+    max_epochs: int,
+    patience: int,
+    monitor_enabled: bool,
+) -> dict[str, object]:
+    completed_epoch = checkpoint["completed_epoch"]
+    best_epoch = checkpoint["best_epoch"]
+    epochs_without_improvement = checkpoint["epochs_without_improvement"]
+    if (
+        type(completed_epoch) is not int
+        or not 1 <= completed_epoch <= max_epochs
+        or type(best_epoch) is not int
+        or not 1 <= best_epoch <= completed_epoch
+        or type(epochs_without_improvement) is not int
+        or epochs_without_improvement < 0
+    ):
+        raise ValueError("resume checkpoint epoch state is invalid")
+    if epochs_without_improvement != completed_epoch - best_epoch:
+        raise ValueError("resume early-stopping counter differs from best epoch")
+
+    history = checkpoint["history_rows"]
+    monitor_rows = checkpoint["monitor_records"]
+    if not isinstance(history, list) or len(history) != completed_epoch:
+        raise ValueError("resume history does not cover every completed epoch")
+    if any(not isinstance(row, Mapping) for row in history):
+        raise TypeError("resume history rows must be mappings")
+    expected_epochs = list(range(1, completed_epoch + 1))
+    if [row.get("epoch") for row in history] != expected_epochs or any(
+        row.get("condition") != condition_name for row in history
+    ):
+        raise ValueError("resume history epoch or condition identity differs")
+    validation_nlls = [
+        float(row["validation_compatible_path_nll"]) for row in history
+    ]
+    if not np.isfinite(validation_nlls).all():
+        raise ValueError("resume history contains non-finite validation NLL")
+    observed_best_nll = float(checkpoint["best_validation_nll"])
+    if (
+        best_epoch != int(np.argmin(validation_nlls)) + 1
+        or observed_best_nll != validation_nlls[best_epoch - 1]
+    ):
+        raise ValueError("resume best checkpoint differs from validation history")
+
+    expected_monitor_count = completed_epoch if monitor_enabled else 0
+    if not isinstance(monitor_rows, list) or len(monitor_rows) != expected_monitor_count:
+        raise ValueError("resume monitor history differs from completed epochs")
+    monitor_records: list[MonitorRecord] = []
+    for expected_epoch, row in enumerate(monitor_rows, start=1):
+        if (
+            not isinstance(row, Mapping)
+            or row.get("seed") != seed
+            or row.get("condition") != condition_name
+            or row.get("epoch") != expected_epoch
+            or row.get("sealed") is not True
+            or row.get("selection_eligible") is not False
+            or not isinstance(row.get("fields"), Mapping)
+        ):
+            raise ValueError("resume monitor record identity differs")
+        monitor_records.append(
+            MonitorRecord(
+                seed=seed,
+                condition=condition_name,
+                epoch=expected_epoch,
+                fields=dict(row["fields"]),
+                sealed=True,
+                selection_eligible=False,
+            )
+        )
+    observed_best_ont = checkpoint["best_ont_matrix_kl_count_weighted"]
+    history_best_ont = history[best_epoch - 1]["ont_matrix_kl_count_weighted"]
+    if monitor_enabled:
+        if (
+            isinstance(observed_best_ont, bool)
+            or not isinstance(observed_best_ont, (int, float))
+            or not np.isfinite(observed_best_ont)
+            or float(observed_best_ont) != float(history_best_ont)
+        ):
+            raise ValueError("resume best ONT monitor differs from epoch history")
+    elif observed_best_ont is not None or any(
+        row["ont_matrix_kl_count_weighted"] is not None for row in history
+    ):
+        raise ValueError("resume contains ONT monitor values while monitoring is disabled")
+
+    expected_training_complete = (
+        completed_epoch >= max_epochs or epochs_without_improvement >= patience
+    )
+    if checkpoint["training_complete"] is not expected_training_complete:
+        raise ValueError("resume terminal state differs from epoch controls")
+    if not isinstance(checkpoint["gene_order_rng_state"], tuple):
+        raise TypeError("resume gene-order RNG state is invalid")
+    global_rng_state = checkpoint["global_rng_state"]
+    if not isinstance(global_rng_state, tuple) or len(global_rng_state) != 4:
+        raise TypeError("resume global RNG state is invalid")
+
+    model_state = checkpoint["model_state_dict"]
+    optimizer_state = checkpoint["optimizer_state_dict"]
+    best_state = checkpoint["best_model_state_dict"]
+    best_optimizer_state = checkpoint["best_optimizer_state_dict"]
+    if not all(
+        isinstance(value, Mapping)
+        for value in (model_state, optimizer_state, best_state, best_optimizer_state)
+    ):
+        raise TypeError("resume model or optimizer state is invalid")
+    model.load_state_dict(model_state, strict=True)
+    optimizer.load_state_dict(optimizer_state)
+    scheduler_state = checkpoint["lr_scheduler_state_dict"]
+    best_scheduler_state = checkpoint["best_lr_scheduler_state_dict"]
+    if lr_scheduler is None:
+        if scheduler_state is not None or best_scheduler_state is not None:
+            raise ValueError("constant-LR resume contains scheduler state")
+    else:
+        if not isinstance(scheduler_state, Mapping) or not isinstance(
+            best_scheduler_state, Mapping
+        ):
+            raise ValueError("scheduled-LR resume lacks scheduler state")
+        lr_scheduler.load_state_dict(scheduler_state)
+
+    return {
+        "completed_epoch": completed_epoch,
+        "history_rows": [dict(row) for row in history],
+        "monitor_records": monitor_records,
+        "best_nll": observed_best_nll,
+        "best_epoch": best_epoch,
+        "best_state": dict(best_state),
+        "best_optimizer_state": dict(best_optimizer_state),
+        "best_lr_scheduler_state": (
+            dict(best_scheduler_state) if best_scheduler_state is not None else None
+        ),
+        "best_ont_matrix_kl": observed_best_ont,
+        "epochs_without_improvement": epochs_without_improvement,
+    }
+
+
+def _best_checkpoint_from_recovery(
+    checkpoint: Mapping[str, object],
+) -> dict[str, object]:
+    manifest = checkpoint["run_identity"]["training_run_manifest"]
+    return {
+        "schema_version": "fabric.training_checkpoint.v2",
+        "checkpoint_role": "best_validation",
+        "run_identity": checkpoint["run_identity"],
+        "seed": manifest["seed"],
+        "condition": manifest["condition"],
+        "completed_epoch": checkpoint["best_epoch"],
+        "best_validation_nll": checkpoint["best_validation_nll"],
+        "best_ont_matrix_kl_count_weighted": checkpoint[
+            "best_ont_matrix_kl_count_weighted"
+        ],
+        "model_state_dict": checkpoint["best_model_state_dict"],
+        "optimizer_state_dict": checkpoint["best_optimizer_state_dict"],
+        "lr_scheduler_state_dict": checkpoint[
+            "best_lr_scheduler_state_dict"
+        ],
+        "held_out_test_evaluated": False,
+    }
+
+
+def _write_recovery_history(
+    run_dir: Path, checkpoint: Mapping[str, object]
+) -> None:
+    history = pd.DataFrame(checkpoint["history_rows"])
+    _atomic_write_text(run_dir / "history.tsv", history.to_csv(sep="\t", index=False))
+    monitor_text = "".join(
+        json.dumps(dict(record), sort_keys=True) + "\n"
+        for record in checkpoint["monitor_records"]
+    )
+    _atomic_write_text(run_dir / "sealed_validation_monitor.jsonl", monitor_text)
+
+
+def _reconcile_recovery_artifacts(
+    run_dir: Path, checkpoint: Mapping[str, object]
+) -> None:
+    _atomic_torch_save(_best_checkpoint_from_recovery(checkpoint), run_dir / "best.pt")
+    _write_recovery_history(run_dir, checkpoint)
+
+
+def _persist_epoch_recovery(
+    state: Mapping[str, object],
+    *,
+    run_dir: Path,
+    run_identity: Mapping[str, object],
+) -> None:
+    checkpoint = {
+        "schema_version": "fabric.training_recovery_checkpoint.v1",
+        "checkpoint_role": "latest_completed_epoch",
+        "recovery_granularity": "next_epoch_after_completed_epoch",
+        "run_identity": copy.deepcopy(dict(run_identity)),
+        **dict(state),
+    }
+    # latest.pt is self-contained, including the selected best state.  Its
+    # atomic replacement is therefore the sole recovery commit point.
+    _atomic_torch_save(checkpoint, run_dir / "latest.pt")
+    if checkpoint["best_improved_this_epoch"] is True:
+        _atomic_torch_save(
+            _best_checkpoint_from_recovery(checkpoint), run_dir / "best.pt"
+        )
+    _write_recovery_history(run_dir, checkpoint)
+
+
 def _write_run(
     run: TrainingRunResult,
     config: Mapping[str, object],
     run_dir: Path,
     genes: Sequence[PreparedGene],
     prepared: PreparedDataset | BackedPreparedDataset | None,
+    *,
+    recovery_identity: Mapping[str, object],
 ) -> None:
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if not run_dir.is_dir():
+        raise FileNotFoundError("run directory disappeared before finalization")
     if set(run.metrics["split"]) != {"val"} or len(run.metrics) != 1:
         raise AssertionError(
             "training artifact writer requires one validation metric row"
         )
-    (run_dir / "config.yaml").write_text(yaml.safe_dump(dict(config), sort_keys=False))
-    (run_dir / "training_run_manifest.json").write_text(
-        json.dumps(asdict(run.manifest), indent=2, sort_keys=True)
+    _atomic_write_text(
+        run_dir / "config.yaml", yaml.safe_dump(dict(config), sort_keys=False)
     )
-    (run_dir / "input_manifest.json").write_text(
+    _atomic_write_text(
+        run_dir / "training_run_manifest.json",
+        json.dumps(asdict(run.manifest), indent=2, sort_keys=True),
+    )
+    _atomic_write_text(
+        run_dir / "input_manifest.json",
         json.dumps(
             {
                 "contract": "FABRIC_ARCHITECTURE_V2",
@@ -3526,21 +4032,27 @@ def _write_run(
             },
             indent=2,
             sort_keys=True,
-        )
+        ),
     )
     run.metrics.to_csv(run_dir / "metrics.tsv", sep="\t", index=False)
-    torch.save(
-        {
-            "schema_version": "fabric.training_checkpoint.v2",
-            "seed": run.manifest.seed,
-            "condition": run.manifest.condition,
-            "completed_epoch": run.result.best_epoch,
-            "model_state_dict": run.result.model.state_dict(),
-            "optimizer_state_dict": run.result.optimizer_state_dict,
-            "lr_scheduler_state_dict": run.result.lr_scheduler_state_dict,
-        },
-        run_dir / "checkpoint.pt",
-    )
+    final_best_checkpoint = {
+        "schema_version": "fabric.training_checkpoint.v2",
+        "checkpoint_role": "best_validation",
+        "run_identity": copy.deepcopy(dict(recovery_identity)),
+        "seed": run.manifest.seed,
+        "condition": run.manifest.condition,
+        "completed_epoch": run.result.best_epoch,
+        "best_validation_nll": run.result.best_validation_nll,
+        "best_ont_matrix_kl_count_weighted": (
+            run.result.best_ont_matrix_kl_count_weighted
+        ),
+        "model_state_dict": _cpu_copy(run.result.model.state_dict()),
+        "optimizer_state_dict": run.result.optimizer_state_dict,
+        "lr_scheduler_state_dict": run.result.lr_scheduler_state_dict,
+        "held_out_test_evaluated": False,
+    }
+    _atomic_torch_save(final_best_checkpoint, run_dir / "best.pt")
+    _atomic_torch_save(final_best_checkpoint, run_dir / "checkpoint.pt")
     run.result.history.to_csv(run_dir / "history.tsv", sep="\t", index=False)
     monitor_rows = [asdict(record) for record in run.result.monitor_records]
     groups = optimizer_parameter_groups(
@@ -3592,7 +4104,15 @@ def _write_run(
                     "model_condition": _MODEL_CONDITION[run.manifest.condition],
                     "readout_kind": run.result.model.readout_kind,
                     "checkpoint_relative_path": "checkpoint.pt",
+                    "best_checkpoint_relative_path": "best.pt",
+                    "latest_recovery_checkpoint_relative_path": "latest.pt",
                     "checkpoint_schema_version": "fabric.training_checkpoint.v2",
+                    "latest_recovery_schema_version": (
+                        "fabric.training_recovery_checkpoint.v1"
+                    ),
+                    "recovery_granularity": (
+                        "next_epoch_after_completed_epoch"
+                    ),
                     "optimizer_state_included": True,
                     "lr_scheduler_state_included": (
                         run.result.lr_scheduler_state_dict is not None
@@ -3651,6 +4171,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train the single FABRIC V2 runtime")
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--resume-from",
+        help=(
+            "resume the same run from its atomic latest.pt after the most recent "
+            "completed epoch"
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--condition", required=True, choices=RUN_CONDITIONS)
@@ -3711,6 +4238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         condition=args.condition,
         device=args.device,
         run_dir=args.run_dir,
+        resume_from=args.resume_from,
     )
     return 0
 

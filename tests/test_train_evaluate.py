@@ -15,6 +15,7 @@ import torch
 import yaml
 from scipy import sparse
 
+import fabric.train as train_module
 from fabric.evaluate import OntMatrixKlTarget
 
 from fabric.train import (
@@ -58,6 +59,24 @@ def _train_full(genes, config, *, seed, device, monitor_callback=None):
         device=device,
         monitor_callback=monitor_callback,
     )
+
+
+def _assert_nested_equal(left, right):
+    if isinstance(left, torch.Tensor):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+    elif isinstance(left, np.ndarray):
+        np.testing.assert_array_equal(left, right)
+    elif isinstance(left, dict):
+        assert set(left) == set(right)
+        for key in left:
+            _assert_nested_equal(left[key], right[key])
+    elif isinstance(left, (tuple, list)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right, strict=True):
+            _assert_nested_equal(left_item, right_item)
+    else:
+        assert left == right
 
 
 def _toy_ont_target(gene):
@@ -715,6 +734,13 @@ def test_one_run_is_end_to_end_and_writes_v2_artifacts(tmp_path):
     assert not checkpoint_manifest["selection_rules_used_held_out_test"]
     assert checkpoint_manifest["record"]["seed"] == 101
     assert checkpoint_manifest["record"]["condition"] == "atac"
+    assert checkpoint_manifest["record"]["best_checkpoint_relative_path"] == "best.pt"
+    assert checkpoint_manifest["record"][
+        "latest_recovery_checkpoint_relative_path"
+    ] == "latest.pt"
+    assert checkpoint_manifest["record"]["recovery_granularity"] == (
+        "next_epoch_after_completed_epoch"
+    )
     assert not checkpoint_manifest["record"]["held_out_test_evaluated"]
     monitor_manifest = json.loads((run_dir / "monitor_manifest.json").read_text())
     assert monitor_manifest["record_count"] == 1
@@ -731,7 +757,257 @@ def test_one_run_is_end_to_end_and_writes_v2_artifacts(tmp_path):
     assert checkpoint["model_state_dict"]
     assert checkpoint["optimizer_state_dict"]["state"]
     assert checkpoint["lr_scheduler_state_dict"] is None
+    latest = torch.load(
+        run_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    assert latest["schema_version"] == "fabric.training_recovery_checkpoint.v1"
+    assert latest["completed_epoch"] == 1
+    assert latest["training_complete"]
+    assert latest["best_model_state_dict"]
+    assert latest["best_optimizer_state_dict"]["state"]
+    assert latest["held_out_test_evaluated"] is False
+    assert (run_dir / "best.pt").exists()
     assert (run_dir / "history.tsv").exists()
+
+
+def test_completed_epoch_resume_exactly_matches_uninterrupted_training(
+    tmp_path, monkeypatch
+):
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 3
+    config["training"]["early_stopping_patience"] = 3
+    config["optimizer"]["learning_rate"] = 0.01
+    config["optimizer"]["lr_scheduler"] = {
+        "name": "reduce_on_plateau",
+        "factor": 0.5,
+        "patience": 0,
+        "min_lr": 0.001,
+    }
+    first = make_toy_genes(seed=23)[0]
+    genes = [first, replace(first, gene_id="TOY_GENE_2")]
+    interrupted_dir = tmp_path / "interrupted"
+    original_persist = train_module._persist_epoch_recovery
+
+    def interrupt_after_first_completed_epoch(state, **kwargs):
+        original_persist(state, **kwargs)
+        if state["completed_epoch"] == 1:
+            raise RuntimeError("simulated process interruption")
+
+    monkeypatch.setattr(
+        train_module, "_persist_epoch_recovery", interrupt_after_first_completed_epoch
+    )
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        train_run(
+            genes,
+            config,
+            seed=42,
+            condition="full",
+            device="cpu",
+            run_dir=interrupted_dir,
+        )
+    monkeypatch.setattr(train_module, "_persist_epoch_recovery", original_persist)
+
+    assert (interrupted_dir / "latest.pt").is_file()
+    assert (interrupted_dir / "best.pt").is_file()
+    assert not (interrupted_dir / "checkpoint.pt").exists()
+    first_latest = torch.load(
+        interrupted_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    assert first_latest["completed_epoch"] == 1
+    assert not first_latest["training_complete"]
+
+    resumed = train_run(
+        genes,
+        config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=interrupted_dir,
+        resume_from=interrupted_dir / "latest.pt",
+    )
+    fresh_dir = tmp_path / "uninterrupted"
+    uninterrupted = train_run(
+        genes,
+        config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=fresh_dir,
+    )
+
+    pd.testing.assert_frame_equal(
+        resumed.result.history, uninterrupted.result.history, check_exact=True
+    )
+    assert resumed.result.best_epoch == uninterrupted.result.best_epoch
+    assert resumed.result.best_validation_nll == (
+        uninterrupted.result.best_validation_nll
+    )
+    for name, value in uninterrupted.result.model.state_dict().items():
+        torch.testing.assert_close(
+            resumed.result.model.state_dict()[name], value, atol=0, rtol=0
+        )
+
+    resumed_latest = torch.load(
+        interrupted_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    uninterrupted_latest = torch.load(
+        fresh_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    for state_name in (
+        "completed_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "lr_scheduler_state_dict",
+        "best_epoch",
+        "best_validation_nll",
+        "best_model_state_dict",
+        "best_optimizer_state_dict",
+        "best_lr_scheduler_state_dict",
+        "epochs_without_improvement",
+        "history_rows",
+        "monitor_records",
+        "gene_order_rng_state",
+        "global_rng_state",
+        "training_complete",
+        "held_out_test_evaluated",
+    ):
+        _assert_nested_equal(resumed_latest[state_name], uninterrupted_latest[state_name])
+    assert resumed_latest["completed_epoch"] == 3
+    assert resumed_latest["training_complete"]
+    assert (interrupted_dir / "checkpoint.pt").is_file()
+
+
+def test_resume_rejects_best_checkpoint_and_identity_or_state_drift(
+    tmp_path, monkeypatch
+):
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 2
+    config["training"]["early_stopping_patience"] = 2
+    genes = make_toy_genes(seed=31)
+    run_dir = tmp_path / "resume_guard"
+    original_persist = train_module._persist_epoch_recovery
+
+    def interrupt_after_first_completed_epoch(state, **kwargs):
+        original_persist(state, **kwargs)
+        raise RuntimeError("simulated process interruption")
+
+    monkeypatch.setattr(
+        train_module, "_persist_epoch_recovery", interrupt_after_first_completed_epoch
+    )
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        train_run(
+            genes,
+            config,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=run_dir,
+        )
+    monkeypatch.setattr(train_module, "_persist_epoch_recovery", original_persist)
+
+    with pytest.raises(ValueError, match="must be the original run_dir/latest.pt"):
+        train_run(
+            genes,
+            config,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=run_dir,
+            resume_from=run_dir / "best.pt",
+        )
+    changed = copy.deepcopy(config)
+    changed["optimizer"]["learning_rate"] = 0.002
+    with pytest.raises(ValueError, match="resolved config differs"):
+        train_run(
+            genes,
+            changed,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=run_dir,
+            resume_from=run_dir / "latest.pt",
+        )
+    renamed_genes = [replace(genes[0], gene_id="DIFFERENT_GENE")]
+    with pytest.raises(ValueError, match="ordered_gene_ids identity differs"):
+        train_run(
+            renamed_genes,
+            config,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=run_dir,
+            resume_from=run_dir / "latest.pt",
+        )
+
+    latest_path = run_dir / "latest.pt"
+    checkpoint = torch.load(latest_path, map_location="cpu", weights_only=False)
+    checkpoint["epochs_without_improvement"] = 1
+    torch.save(checkpoint, latest_path)
+    with pytest.raises(ValueError, match="early-stopping counter"):
+        train_run(
+            genes,
+            config,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=run_dir,
+            resume_from=latest_path,
+        )
+
+
+def test_terminal_latest_checkpoint_can_finish_artifact_finalization(
+    tmp_path, monkeypatch
+):
+    config = _one_epoch_config()
+    genes = make_toy_genes(seed=37)
+    run_dir = tmp_path / "terminal_recovery"
+    original_persist = train_module._persist_epoch_recovery
+
+    def interrupt_after_terminal_checkpoint(state, **kwargs):
+        original_persist(state, **kwargs)
+        raise RuntimeError("interrupted before final artifacts")
+
+    monkeypatch.setattr(
+        train_module, "_persist_epoch_recovery", interrupt_after_terminal_checkpoint
+    )
+    with pytest.raises(RuntimeError, match="interrupted before final artifacts"):
+        train_run(
+            genes,
+            config,
+            seed=42,
+            condition="rbp",
+            device="cpu",
+            run_dir=run_dir,
+        )
+    monkeypatch.setattr(train_module, "_persist_epoch_recovery", original_persist)
+    latest = torch.load(
+        run_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    assert latest["completed_epoch"] == 1
+    assert latest["training_complete"]
+    assert not (run_dir / "checkpoint.pt").exists()
+
+    recovered = train_run(
+        genes,
+        config,
+        seed=42,
+        condition="rbp",
+        device="cpu",
+        run_dir=run_dir,
+        resume_from=run_dir / "latest.pt",
+    )
+    assert recovered.result.history["epoch"].tolist() == [1]
+    assert (run_dir / "checkpoint.pt").is_file()
+    assert (run_dir / "metrics.tsv").is_file()
+
+
+def test_run_directory_lock_rejects_a_concurrent_writer(tmp_path):
+    run_dir = tmp_path / "locked_run"
+    run_dir.mkdir()
+    with train_module._exclusive_run_lock(run_dir):
+        with pytest.raises(RuntimeError, match="another training process"):
+            with train_module._exclusive_run_lock(run_dir):
+                raise AssertionError("concurrent lock unexpectedly succeeded")
 
 
 def test_python_module_cli_loads_exact_prepared_dataset_identity(tmp_path):
