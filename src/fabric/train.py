@@ -10,7 +10,6 @@ import fcntl
 import json
 import os
 import random
-import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
@@ -32,6 +31,7 @@ from .model import (
     GeneCellModelInput,
     RoutedModalityInput,
 )
+from .source_identity import committed_source_identity
 
 
 # ``python -m fabric.train`` executes this file as ``__main__``.  Bind the
@@ -3696,22 +3696,7 @@ def _training_recovery_identity(
 
 
 def _runtime_source_commit(*, require_clean: bool) -> str:
-    repository = Path(__file__).resolve().parents[2]
-    if require_clean:
-        status = subprocess.run(
-            ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if status:
-            raise RuntimeError("full-cohort training requires a committed src/fabric source tree")
-    return subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    return committed_source_identity(require_clean=require_clean)
 
 
 def _write_initial_run_identity(

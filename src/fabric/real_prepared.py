@@ -15,7 +15,6 @@ import itertools
 import json
 import math
 from pathlib import Path
-import subprocess
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -37,6 +36,7 @@ from .dataset import (
     build_model_injection_equivalence_index,
 )
 from .graph import build_gene_graph
+from .source_identity import committed_source_identity
 from .train import prepared_gene_from_assembly
 
 
@@ -57,21 +57,7 @@ INTERACTION_SUPPORT_THRESHOLDS = {
 
 
 def _clean_source_commit() -> str:
-    repository = Path(__file__).resolve().parents[2]
-    status = subprocess.run(
-        ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if status:
-        raise RuntimeError("real prepared artifacts require a committed src/fabric source tree")
-    return subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    return committed_source_identity(require_clean=True)
 
 
 def _validated_real_dataset_source(root: Path) -> tuple[str, str]:
