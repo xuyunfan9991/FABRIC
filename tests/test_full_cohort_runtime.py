@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 
 import pandas as pd
 import pytest
@@ -11,6 +12,7 @@ import torch
 
 from fabric.evaluate import OntMatrixKlTarget
 from fabric.real_dataset import compile_gene_graph_tables
+from fabric.source_identity import committed_source_identity
 from fabric.profile_real import (
     _fit_conservative_nonnegative_cost_model,
     _project_epoch_seconds,
@@ -33,6 +35,16 @@ from fabric.train import (
     training_manifest_from_config,
 )
 from fabric.train import _iter_gene_order
+
+
+def test_source_identity_tracks_the_committed_source_tree():
+    expected = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", "src/fabric"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert committed_source_identity(require_clean=False) == expected
 
 
 def test_full_cohort_config_is_single_run_and_test_blind():

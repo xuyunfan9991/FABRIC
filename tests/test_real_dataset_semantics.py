@@ -135,14 +135,10 @@ def test_jaspar_double_colon_names_are_unmodeled_heterodimers():
 def test_real_build_identity_is_immutable_within_one_output_root(
     tmp_path, monkeypatch
 ):
-    class Result:
-        def __init__(self, stdout):
-            self.stdout = stdout
-
-    def fake_run(command, **_kwargs):
-        return Result("" if "status" in command else "source-commit\n")
-
-    monkeypatch.setattr("fabric.real_dataset.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "fabric.real_dataset.committed_source_identity",
+        lambda *, require_clean: "source-commit",
+    )
     output = tmp_path / "fresh"
     paths = {"real_dataset": output, "reference": tmp_path / "reference.fa"}
     _write_source_validation(paths, output)

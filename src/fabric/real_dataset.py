@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
-import subprocess
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -44,6 +43,7 @@ from .dataset import (
     transform_gates,
 )
 from .graph import GraphTables, build_gene_graph
+from .source_identity import committed_source_identity
 from .motifs import (
     accessibility_only_hits,
     assign_unique_peak_to_dna_hits,
@@ -2725,21 +2725,7 @@ def merge_gate_gene_chunks(
 
 
 def _write_source_validation(paths: Mapping[str, Path], output: Path) -> None:
-    repository = Path(__file__).resolve().parents[2]
-    status = subprocess.run(
-        ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if status:
-        raise RuntimeError("real dataset build requires a committed src/fabric source tree")
-    source_commit = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    source_commit = committed_source_identity(require_clean=True)
     source_paths = {
         key: str(value) for key, value in paths.items() if key != "real_dataset"
     }
