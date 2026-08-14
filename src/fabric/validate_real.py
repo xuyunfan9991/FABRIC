@@ -191,6 +191,13 @@ def validate_real_dataset(
         total_paths += len(gene.path_ids)
         total_edges += gene.model_input.cis_features.shape[0]
     upstream = json.loads((compatible / "CompatibilityArtifactManifest.json").read_text())
+    if (
+        upstream.get("run_counts", {}).get(
+            "duplicate_cell_gene_umi_primary_records"
+        )
+        != 0
+    ):
+        raise ValueError("upstream compatible artifact contains duplicate cell-gene-UMIs")
     candidate_expected = {
         str(row["split"]): int(row["proper_subset_compatible_molecule_mass"])
         for row in upstream["split_conservation"]

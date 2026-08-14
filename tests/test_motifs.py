@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,9 +12,83 @@ from fabric.motifs import (
     _cap_route_decisions,
     build_candidate_routes,
     build_factor_catalog,
+    build_graph_anchor_regions,
     build_route_burden,
     collapse_physical_events,
 )
+
+
+def _endpoint_graph(strand: str):
+    positions = {"TSS": 1_000, "PAS": 2_000}
+    if strand == "-":
+        positions = {"TSS": 2_000, "PAS": 1_000}
+    nodes = pd.DataFrame(
+        [
+            {
+                "node_id": f"{strand}:{node_type}",
+                "node_type": node_type,
+                "pos_0based": position,
+                "chrom": "chr1",
+                "strand": strand,
+            }
+            for node_type, position in positions.items()
+        ]
+    )
+    edges = pd.DataFrame(
+        [
+            {
+                "edge_id": f"{strand}:edge",
+                "src_node_id": f"{strand}:TSS",
+                "dst_node_id": f"{strand}:PAS",
+                "edge_type": "EXON_CONTINUATION",
+                "start_0based": 1_000,
+                "end_0based_exclusive": 2_000,
+                "chrom": "chr1",
+                "strand": strand,
+            }
+        ]
+    )
+    return SimpleNamespace(gene_id=f"gene:{strand}", nodes=nodes, edges=edges)
+
+
+def test_site_windows_follow_transcript_direction_and_ignore_gene_bounds():
+    expected = {
+        "+": {"TSS": (800, 1_050), "PAS": (1_950, 2_200)},
+        "-": {"TSS": (1_950, 2_200), "PAS": (800, 1_050)},
+    }
+    for strand in ("+", "-"):
+        anchors = build_graph_anchor_regions(
+            _endpoint_graph(strand),
+            modality="DNA",
+            site_flanks={"TSS": (200, 50), "PAS": (50, 200)},
+            maximum_short_exon_bp=500,
+            contig_lengths={"chr1": 3_000},
+            gene_bounds=(1_000, 2_001),
+        )
+        sites = anchors.loc[anchors["geometry_kind"].eq("site_window")]
+        observed = {
+            row.anchor_type: (row.region_start, row.region_end)
+            for row in sites.itertuples(index=False)
+        }
+        assert observed == expected[strand]
+        assert not sites["region_clipped"].any()
+
+    boundary_graph = _endpoint_graph("+")
+    boundary_graph.nodes["pos_0based"] -= 980
+    boundary_graph.edges["start_0based"] -= 980
+    boundary_graph.edges["end_0based_exclusive"] -= 980
+    clipped = build_graph_anchor_regions(
+        boundary_graph,
+        modality="DNA",
+        site_flanks={"TSS": (100, 50)},
+        maximum_short_exon_bp=500,
+        contig_lengths={"chr1": 1_500},
+        gene_bounds=(20, 1_021),
+    )
+    tss = clipped.loc[clipped["anchor_type"].eq("TSS")].iloc[0]
+    assert (tss.raw_region_start, tss.raw_region_end) == (-80, 70)
+    assert (tss.region_start, tss.region_end) == (0, 70)
+    assert tss.region_clipped
 
 
 def test_factor_catalog_rejects_empty_or_duplicate_identity_members():
@@ -200,13 +276,15 @@ def test_site_route_geometry_has_strict_overlap_na_touch_and_negative_half_cente
     events = pd.DataFrame(
         [
             _event("overlap"),
+            _event("starts_at_anchor"),
             _event("touch"),
             _event("negative"),
         ]
     )
     events.loc[0, ["start", "end"]] = [99, 102]
-    events.loc[1, ["start", "end"]] = [98, 100]
-    events.loc[2, ["start", "end", "strand"]] = [103, 106, "-"]
+    events.loc[1, ["start", "end"]] = [100, 106]
+    events.loc[2, ["start", "end"]] = [98, 100]
+    events.loc[3, ["start", "end", "strand"]] = [103, 106, "-"]
     anchors = pd.DataFrame(
         {
             "target_gene_id": ["g", "g"],
@@ -231,11 +309,17 @@ def test_site_route_geometry_has_strict_overlap_na_touch_and_negative_half_cente
     touch = routes.loc[
         (routes.event_id == "touch") & (routes.anchor_region_id == "plus")
     ].iloc[0]
+    starts_at_anchor = routes.loc[
+        (routes.event_id == "starts_at_anchor")
+        & (routes.anchor_region_id == "plus")
+    ].iloc[0]
     negative = routes.loc[
         (routes.event_id == "negative") & (routes.anchor_region_id == "minus")
     ].iloc[0]
     assert overlap.transcript_oriented_side == "OVERLAP_ANCHOR"
     assert np.isnan(overlap.signed_distance_bp)
+    assert starts_at_anchor.transcript_oriented_side == "OVERLAP_ANCHOR"
+    assert np.isnan(starts_at_anchor.signed_distance_bp)
     assert touch.transcript_oriented_side == "UPSTREAM"
     assert touch.signed_distance_bp == -1.0
     assert negative.transcript_oriented_side == "UPSTREAM"

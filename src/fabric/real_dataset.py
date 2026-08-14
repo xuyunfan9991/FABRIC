@@ -54,6 +54,7 @@ from .motifs import (
     collapse_physical_events,
     parse_cisbp_motifs,
     parse_meme_motifs,
+    transcript_relative_interval,
 )
 
 
@@ -453,6 +454,7 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
                 f"{dst_type}:{dst_pos}:{strand}"
             )
             start, end = sorted((src_pos, dst_pos))
+            span_bp = end - start
             record = {
                 "gene_id": gene_id,
                 "edge_id": edge_id,
@@ -465,8 +467,8 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
                 "strand": strand,
                 "start_0based": start,
                 "end_0based_exclusive": end,
-                "span_bp": end - start,
-                "length_bp": end - start,
+                "span_bp": span_bp,
+                "length_bp": 0 if edge_type == "SPLICE" else span_bp,
                 "relative_edge_pos": (
                     (start - gene_start) / span
                     if strand == "+"
@@ -565,6 +567,13 @@ def build_graph_stage(paths: Mapping[str, Path], output: Path) -> None:
         "path_count": len(legal),
         "node_count": sum(len(value) for value in tables["node_table"]),
         "edge_count": sum(len(value) for value in tables["edge_table"]),
+        "edge_length_semantics": {
+            "span_bp": "genomic distance between processing sites",
+            "SPLICE.length_bp": 0,
+            "EXON_CONTINUATION.length_bp": "span_bp",
+            "RETAINED_INTRON.length_bp": "span_bp",
+            "path_length_bp": "sum of retained edge length_bp",
+        },
         "graph_only_gene_count": int(
             support["support_status"].astype(str).eq(
                 "graph_only_zero_train_informative_mass"
@@ -647,27 +656,34 @@ def _cis_sequence_scores(edges: pd.DataFrame, nodes: pd.DataFrame, fasta_path: P
                 continue
             position = sites[site_type]
             if feature == "donor_strength":
-                seq = _fetch_oriented(fasta, chrom, position - 3, position + 6, strand)
+                start, end = transcript_relative_interval(position, -3, 6, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _max_consensus_fraction(seq, ["NNNGTRAGT"])
             elif feature == "acceptor_strength":
-                seq = _fetch_oriented(fasta, chrom, position - 20, position + 3, strand)
+                start, end = transcript_relative_interval(position, -20, 3, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _max_consensus_fraction(seq, ["YYYYYYYYYYYYYYYYYYAGNNN"])
             elif feature == "branchpoint_score":
-                seq = _fetch_oriented(fasta, chrom, position - 50, position - 5, strand)
+                start, end = transcript_relative_interval(position, -50, -5, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _max_consensus_fraction(seq, ["YTNAY"])
             elif feature == "polypyrimidine_tract_score":
-                seq = _fetch_oriented(fasta, chrom, position - 25, position - 3, strand)
+                start, end = transcript_relative_interval(position, -25, -3, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _fraction(seq, {"C", "T"})
             elif feature == "tss_core_promoter_score":
-                seq = _fetch_oriented(fasta, chrom, position - 40, position + 10, strand)
+                start, end = transcript_relative_interval(position, -40, 10, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _max_consensus_fraction(seq, ["TATAWA"])
             elif feature == "polya_hexamer_score":
-                seq = _fetch_oriented(fasta, chrom, position - 50, position, strand)
+                start, end = transcript_relative_interval(position, -50, 0, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _max_consensus_fraction(
                     seq, ["AATAAA", "ATTAAA", "TATAAA", "AGTAAA"]
                 )
             else:
-                seq = _fetch_oriented(fasta, chrom, position, position + 50, strand)
+                start, end = transcript_relative_interval(position, 0, 50, strand)
+                seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _fraction(seq, {"T", "G"})
         rows.append(record)
     return pd.DataFrame(rows)
@@ -1331,6 +1347,23 @@ def _load_real_graphs(graph_root: Path) -> Iterable[object]:
         )
 
 
+def _ordered_peak_interval_arrays(
+    peaks: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the arrays required by the frozen monotone interval query."""
+
+    starts = peaks["start"].to_numpy(np.int64)
+    ends = peaks["end"].to_numpy(np.int64)
+    if len(starts) > 1 and (
+        bool((starts[1:] < starts[:-1]).any())
+        or bool((ends[1:] < ends[:-1]).any())
+    ):
+        raise ValueError(
+            "consensus peak interval query requires monotone starts and ends"
+        )
+    return starts, ends, peaks["peak_row_0based"].to_numpy(np.int64)
+
+
 def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
     """Freeze graph-defined DNA/RNA windows and exact consensus-peak membership."""
 
@@ -1408,11 +1441,7 @@ def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
         for chrom, group in peak_bed.groupby("chromosome", sort=False)
     }
     arrays = {
-        chrom: (
-            frame["start"].to_numpy(np.int64),
-            frame["end"].to_numpy(np.int64),
-            frame["peak_row_0based"].to_numpy(np.int64),
-        )
+        chrom: _ordered_peak_interval_arrays(frame)
         for chrom, frame in peak_by_chrom.items()
     }
     for row in dna.itertuples(index=False):
@@ -1443,7 +1472,9 @@ def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
         "dna_site_flanks_transcript_oriented": {key: list(value) for key, value in dna_flanks.items()},
         "rna_site_flanks_transcript_oriented": {key: list(value) for key, value in rna_flanks.items()},
         "rna_maximum_short_exon_bp": 500,
+        "site_window_clipping": "reference_contig_only",
         "dna_edge_policy": "complete processing-edge interval, motif events require consensus-peak overlap",
+        "consensus_peak_interval_query_contract": "start_and_end_monotone_validated_per_contig",
         "peak_support_semantics": "binary membership in the frozen shared consensus BED",
         "anchor_carrier_row_count": len(anchor_table),
         "dna_peak_gene_pair_count": len(assigned),

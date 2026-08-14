@@ -52,6 +52,7 @@ def _compatibility_fixture():
         "train_policy_identity": "policy-v1",
         "validation_policy_identity": "policy-v1",
         "test_exposure": "not_materialized_before_checkpoint",
+        "run_counts": {"duplicate_cell_gene_umi_primary_records": 0},
         "artifact_complete": True,
         "G_fit_freeze_status": "FROZEN_FROM_TRAIN_ONLY",
         "test_rows_written": False,
@@ -105,6 +106,18 @@ def test_compatibility_manifest_accepts_frozen_nonlexicographic_axis_and_fails_d
     assert admission["model_isoform_universe"] == (
         "resolved_ont_matrix_structural_paths_only"
     )
+    duplicated_molecule_identity = dict(
+        manifest,
+        run_counts={"duplicate_cell_gene_umi_primary_records": 1},
+    )
+    rejected = validate_compatibility_artifact(
+        duplicated_molecule_identity,
+        rows,
+        legal_paths_by_gene=legal,
+        expected_candidate_gene_ids=["g", "g_zero"],
+        expected_candidate_gene_count=2,
+    )
+    assert "duplicate_cell_gene_umi_primary_records_detected" in rejected.reasons
     reversed_row = rows.copy()
     reversed_row.at[1, "compatible_path_ids"] = ["path:a", "path:z"]
     rejected = validate_compatibility_artifact(
