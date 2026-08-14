@@ -235,6 +235,17 @@ def build_factor_catalog(
         raise ValueError("factor mapping modality must be DNA or RNA")
     if mapping.duplicated(["modality", "motif_id"]).any():
         raise ValueError("one motif may map to only one frozen factor/entity")
+    if "motif_equivalence_family_id" not in mapping:
+        mapping["motif_equivalence_family_id"] = mapping["motif_id"].astype(str)
+    else:
+        mapping["motif_equivalence_family_id"] = [
+            _nullable_text(family_id) or str(motif_id)
+            for motif_id, family_id in zip(
+                mapping["motif_id"],
+                mapping["motif_equivalence_family_id"],
+                strict=True,
+            )
+        ]
 
     axis = None if frozen_rna_gene_axis is None else tuple(map(str, frozen_rna_gene_axis))
     if axis is not None and len(axis) != len(set(axis)):
@@ -382,6 +393,9 @@ def scan_motif_regions(
             raise ValueError("motif scan region strand must be '+' or '-'")
         for identity in mapping.itertuples(index=False):
             motif_id = str(identity.motif_id)
+            family_id = _nullable_text(
+                getattr(identity, "motif_equivalence_family_id", None)
+            ) or motif_id
             if motif_id not in motifs:
                 raise ValueError(f"factor mapping references absent motif {motif_id}")
             motif = motifs[motif_id]
@@ -423,9 +437,7 @@ def scan_motif_regions(
                         "activity_proxy_rule": str(identity.activity_proxy_rule),
                         "modality": modality,
                         "motif_id": motif_id,
-                        "motif_equivalence_family_id": str(
-                            getattr(identity, "motif_equivalence_family_id", motif_id)
-                        ),
+                        "motif_equivalence_family_id": family_id,
                         "chromosome": str(region.chromosome),
                         "start": hit_start,
                         "end": hit_end,
@@ -752,28 +764,34 @@ def collapse_physical_events(
             if kind == "accessibility_only"
             else sorted(set(component["motif_id"].astype(str)))
         )
-        source_coordinates = [
-            {
-                "source_hit_id": str(row.source_hit_id),
-                "source_window_id": _nullable_text(getattr(row, "source_window_id", None)),
-                "source_window_ids": (
-                    _string_list(getattr(row, "source_window_ids"), "source_window_ids")
-                    if hasattr(row, "source_window_ids")
-                    else [str(getattr(row, "source_window_id"))]
-                ),
-                "overlapping_peak_ids": (
-                    _string_list(getattr(row, "overlapping_peak_ids"), "overlapping_peak_ids")
-                    if hasattr(row, "overlapping_peak_ids")
-                    else []
-                ),
-                "chromosome": str(row.chromosome),
-                "start": int(row.start),
-                "end": int(row.end),
-            }
-            for row in component.sort_values("source_hit_id", kind="mergesort").itertuples(
-                index=False
+        source_coordinates = []
+        for source_row in component.sort_values(
+            "source_hit_id", kind="mergesort"
+        ).itertuples(index=False):
+            source_window_id = _nullable_text(
+                getattr(source_row, "source_window_id", None)
             )
-        ]
+            source_window_ids = getattr(source_row, "source_window_ids", None)
+            overlapping_peak_ids = getattr(source_row, "overlapping_peak_ids", None)
+            source_coordinates.append(
+                {
+                    "source_hit_id": str(source_row.source_hit_id),
+                    "source_window_id": source_window_id,
+                    "source_window_ids": (
+                        [source_window_id]
+                        if _is_missing(source_window_ids) and source_window_id is not None
+                        else _string_list(source_window_ids, "source_window_ids")
+                    ),
+                    "overlapping_peak_ids": (
+                        []
+                        if _is_missing(overlapping_peak_ids)
+                        else _string_list(overlapping_peak_ids, "overlapping_peak_ids")
+                    ),
+                    "chromosome": str(source_row.chromosome),
+                    "start": int(source_row.start),
+                    "end": int(source_row.end),
+                }
+            )
         candidate_factors = _string_list(
             representative["candidate_factor_ids"], "candidate_factor_ids"
         )
@@ -1017,7 +1035,7 @@ def build_candidate_routes(
                 if not (int(event.start) < region_end and int(event.end) > region_start):
                     continue
                 anchor_position = int(anchor.anchor_position)
-                if int(event.start) <= anchor_position < int(event.end):
+                if int(event.start) < anchor_position < int(event.end):
                     side = "OVERLAP_ANCHOR"
                     signed_distance = np.nan
                 else:
@@ -1763,10 +1781,14 @@ def _string_list(value: object, label: str) -> list[str]:
     return result
 
 
+def _is_missing(value: object) -> bool:
+    return value is None or value is pd.NA or (
+        isinstance(value, (float, np.floating)) and np.isnan(value)
+    )
+
+
 def _nullable_text(value: object) -> str | None:
-    if value is None or value is pd.NA:
-        return None
-    if isinstance(value, float) and np.isnan(value):
+    if _is_missing(value):
         return None
     text = str(value)
     return None if text in {"", "NA", "nan", "None"} else text

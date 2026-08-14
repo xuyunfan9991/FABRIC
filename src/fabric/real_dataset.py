@@ -15,13 +15,12 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import hdf5plugin  # noqa: F401 - registers the HDF5 compression filters
-import pyarrow.dataset as pads
-import pyarrow.parquet as pq
 import yaml
 from pyfaidx import Fasta
 from sklearn.neighbors import NearestNeighbors
@@ -47,6 +46,7 @@ from .dataset import (
 from .graph import GraphTables, build_gene_graph
 from .motifs import (
     accessibility_only_hits,
+    assign_unique_peak_to_dna_hits,
     build_factor_catalog,
     build_candidate_routes,
     build_graph_anchor_regions,
@@ -356,13 +356,28 @@ def compile_gene_graph_tables(path_rows: pd.DataFrame) -> GraphTables:
                 if start < min(donor, acceptor)
                 and max(donor, acceptor) < end
             )
-            merged_intervals: list[list[int]] = []
+            overlap_component: list[tuple[int, int]] = []
+            component_end = -1
             for low, high in retained_intervals:
-                if merged_intervals and low <= merged_intervals[-1][1]:
-                    merged_intervals[-1][1] = max(merged_intervals[-1][1], high)
+                if overlap_component and low <= component_end:
+                    overlap_component.append((low, high))
+                    component_end = max(component_end, high)
                 else:
-                    merged_intervals.append([low, high])
-            for low, high in merged_intervals:
+                    if len(overlap_component) > 1:
+                        raise ValueError(
+                            "retained exon covers an unresolved overlapping-intron "
+                            f"component for {gene_id}/{row.path_id}: "
+                            f"exon=({start}, {end}), introns={overlap_component}"
+                        )
+                    overlap_component = [(low, high)]
+                    component_end = high
+            if len(overlap_component) > 1:
+                raise ValueError(
+                    "retained exon covers an unresolved overlapping-intron "
+                    f"component for {gene_id}/{row.path_id}: "
+                    f"exon=({start}, {end}), introns={overlap_component}"
+                )
+            for low, high in retained_intervals:
                 donor, acceptor = (low, high) if strand == "+" else (high, low)
                 retained_pairs.add((donor, acceptor))
                 boundaries.update((donor, acceptor))
@@ -636,6 +651,8 @@ def _cis_sequence_scores(edges: pd.DataFrame, nodes: pd.DataFrame, fasta_path: P
         edge_sequence = _fetch_oriented(
             fasta, chrom, int(edge.start_0based), int(edge.end_0based_exclusive), strand
         )
+        if len(edge_sequence) != int(edge.end_0based_exclusive) - int(edge.start_0based):
+            raise ValueError(f"CIS edge interval crosses a reference-contig boundary: {edge.edge_id}")
         record: dict[str, object] = {"edge_id": str(edge.edge_id)}
         record["edge_gc_fraction"] = _fraction(edge_sequence, {"G", "C"})
         record["edge_gc_fraction_available"] = True
@@ -685,6 +702,9 @@ def _cis_sequence_scores(edges: pd.DataFrame, nodes: pd.DataFrame, fasta_path: P
                 start, end = transcript_relative_interval(position, 0, 50, strand)
                 seq = _fetch_oriented(fasta, chrom, start, end, strand)
                 record[feature] = _fraction(seq, {"T", "G"})
+            if len(seq) != end - start:
+                record[f"{feature}_available"] = False
+                record[feature] = 0.0
         rows.append(record)
     return pd.DataFrame(rows)
 
@@ -745,11 +765,41 @@ def build_cis_stage(paths: Mapping[str, Path], output: Path) -> None:
         "candidate_edge_count": len(edges),
         "g_fit_gene_count": len(g_fit),
         "model_feature_order": list(normalized.column_names),
+        "model_design_rank_closure": {
+            "population": "train_admitted_unique_structural_edges",
+            "explicit_model_bias_included": True,
+            "candidate_column_count": len(raw.column_names),
+            "retained_column_count": len(normalized.column_names),
+            "status": "FULL_COLUMN_RANK_WITH_BIAS",
+        },
         "sequence_feature_specs": [asdict(value) for value in manifest.sequence_features],
         "normalization_statistics": [asdict(value) for value in fitted.statistics],
         "test_rows_or_test_outcomes_read": False,
     }
     (cis_root / "CISManifest.json").write_text(json.dumps(record, indent=2) + "\n")
+
+
+def _admissible_atac_neighbors(
+    distances: np.ndarray,
+    indices: np.ndarray,
+    *,
+    maximum_distance: float,
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep only absolute-distance-admitted neighbors and renormalize them."""
+
+    distance_row = np.asarray(distances, dtype=np.float64)
+    index_row = np.asarray(indices, dtype=np.int64)
+    if distance_row.ndim != 1 or index_row.shape != distance_row.shape:
+        raise ValueError("ATAC neighbor distances and indices must be aligned vectors")
+    legal = np.isfinite(distance_row) & (distance_row <= maximum_distance)
+    admitted_distances = distance_row[legal]
+    admitted_indices = index_row[legal]
+    if not len(admitted_distances):
+        return admitted_distances, admitted_indices, np.empty(0, dtype=np.float64)
+    raw_weight = np.exp(-admitted_distances / temperature)
+    weights = raw_weight / raw_weight.sum()
+    return admitted_distances, admitted_indices, weights
 
 
 def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
@@ -909,25 +959,31 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
         for source_row, distance_row, index_row in zip(
             embedded.itertuples(index=False), distances, indices, strict=True
         ):
-            valid = bool(distance_row[0] <= distance_threshold)
-            raw_weight = np.exp(-distance_row.astype(np.float64) / temperature)
-            weights = raw_weight / raw_weight.sum()
-            neighbor_rows.append(
-                pd.DataFrame(
-                    {
-                        "cell_id": str(source_row.cell_id),
-                        "split": str(source_row.split),
-                        "developmental_system": str(system),
-                        "stage_window": str(window),
-                        "neighbor_rank": np.arange(k, dtype=np.int16),
-                        "atac_cell_id": [atac_ids[index] for index in index_row],
-                        "atac_matrix_row_0based": index_row.astype(np.int64),
-                        "distance": distance_row.astype(np.float32),
-                        "weight": weights.astype(np.float32),
-                        "mapping_valid": valid,
-                    }
-                )
+            legal_distances, legal_indices, weights = _admissible_atac_neighbors(
+                distance_row,
+                index_row,
+                maximum_distance=distance_threshold,
+                temperature=temperature,
             )
+            valid = bool(len(legal_distances))
+            if valid:
+                neighbor_rows.append(
+                    pd.DataFrame(
+                        {
+                            "cell_id": str(source_row.cell_id),
+                            "split": str(source_row.split),
+                            "developmental_system": str(system),
+                            "stage_window": str(window),
+                            "neighbor_rank": np.arange(len(legal_distances), dtype=np.int16),
+                            "atac_cell_id": [atac_ids[index] for index in legal_indices],
+                            "atac_matrix_row_0based": legal_indices.astype(np.int64),
+                            "distance": legal_distances.astype(np.float32),
+                            "weight": weights.astype(np.float32),
+                            "mapping_valid": True,
+                        }
+                    )
+                )
+            ess = 1.0 / float(np.square(weights).sum()) if valid else np.nan
             audit_rows.append(
                 {
                     "cell_id": str(source_row.cell_id),
@@ -938,6 +994,13 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
                     "atlas_cell_count": len(atlas_rows),
                     "nearest_distance": float(distance_row[0]),
                     "distance_threshold": distance_threshold,
+                    "candidate_neighbor_count": k,
+                    "valid_neighbor_count": len(legal_distances),
+                    "ess_atac": ess,
+                    "maximum_neighbor_weight": float(weights.max()) if valid else np.nan,
+                    "weighted_mean_distance": (
+                        float(np.dot(weights, legal_distances)) if valid else np.nan
+                    ),
                     "mapping_valid": valid,
                     "failure_reason": "" if valid else "nearest_distance_above_train_q99",
                 }
@@ -967,12 +1030,19 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
     valid_counts = neighbors.groupby("cell_id", sort=False).size()
     expected_valid = set(
         audit.loc[
-            audit["has_glue_embedding"] & audit["atlas_cell_count"].ge(k),
+            audit["mapping_valid"].astype(bool),
             "cell_id",
         ].astype(str)
     )
-    if set(valid_counts.index.astype(str)) != expected_valid or not bool((valid_counts == k).all()):
-        raise ValueError("embedded RNA targets do not have exactly 30 frozen neighbors")
+    if (
+        set(valid_counts.index.astype(str)) != expected_valid
+        or bool((valid_counts < 1).any())
+        or bool((valid_counts > k).any())
+    ):
+        raise ValueError("valid RNA targets do not have 1..30 admitted ATAC neighbors")
+    weight_sums = neighbors.groupby("cell_id", sort=False)["weight"].sum()
+    if not np.allclose(weight_sums.to_numpy(np.float64), 1.0, atol=1.0e-6, rtol=0):
+        raise ValueError("admitted ATAC neighbor weights do not sum to one")
     neighbors.to_parquet(context_root / "rna_atac_neighbors.parquet", index=False)
     audit.to_parquet(context_root / "ATACMappingAudit.parquet", index=False)
     pd.DataFrame(thresholds).to_parquet(
@@ -986,7 +1056,8 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
         "target_train_cell_count": int(target_meta["split"].eq("train").sum()),
         "target_validation_cell_count": int(target_meta["split"].eq("val").sum()),
         "target_test_cell_count": 0,
-        "k": k,
+        "maximum_candidate_k": k,
+        "admitted_k_policy": "1..30 neighbors within the frozen absolute distance range",
         "strata": ["developmental_system", "stage_window"],
         "stratum_field_sources": {
             "developmental_system": "atac_peak_counts.obs.developmental_system",
@@ -994,7 +1065,10 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
         },
         "distance": "euclidean_in_frozen_50d_X_glue",
         "train_only_threshold": "per-stratum q99 nearest RNA-to-ATAC distance",
-        "weight": "exp(-distance/train_median_nearest_distance), normalized per RNA cell",
+        "weight": (
+            "exp(-distance/train_median_nearest_distance), normalized only across "
+            "distance-admitted neighbors per RNA cell"
+        ),
         "missing_rna_glue_embedding_policy": "explicit mapping_invalid, zero ATAC gate mask",
         "valid_mapping_count": int(audit["mapping_valid"].sum()),
         "invalid_mapping_count": int((~audit["mapping_valid"]).sum()),
@@ -1038,6 +1112,10 @@ def _jaspar_symbols(name: str) -> list[str]:
     return [value for value in cleaned.split("::") if value]
 
 
+def _is_jaspar_heterodimer(name: str) -> bool:
+    return "::" in re.sub(r"\([^)]*\)", "", str(name))
+
+
 def build_factor_stage(paths: Mapping[str, Path], output: Path) -> None:
     """Map DNA/RNA motif libraries to the frozen RNA Ensembl-gene axis."""
 
@@ -1063,6 +1141,17 @@ def build_factor_stage(paths: Mapping[str, Path], output: Path) -> None:
     for row in dna_index.itertuples(index=False):
         motif_id, name = str(row.motif_id), str(row.tf_name)
         symbols = _jaspar_symbols(name)
+        if _is_jaspar_heterodimer(name):
+            excluded.append(
+                {
+                    "modality": "DNA",
+                    "motif_id": motif_id,
+                    "source_name": name,
+                    "candidate_symbols": symbols,
+                    "reason": "heterodimer_complex_unmodeled",
+                }
+            )
+            continue
         gene_ids = [symbol_to_id.get(value.upper(), "") for value in symbols]
         if not symbols or any(not value or value not in axis_set for value in gene_ids):
             excluded.append(
@@ -1796,10 +1885,10 @@ def build_event_scan_stage(
         (shard_output_root / name / f"part-{suffix}.parquet").is_file()
         for name in completed_tables
     ):
-        # A chromosome shard is an immutable split-neutral catalog.  This
-        # narrow resume boundary avoids rescanning sequence after an unrelated
-        # downstream failure; it does not select or intersect any biology.
-        return
+        raise FileExistsError(
+            "completed event shard already exists without a current-source/upstream "
+            f"identity proof: {suffix}; use a fresh output root"
+        )
     required = [
         event_root / "graph_anchor_regions.parquet",
         event_root / "dna_peak_gene_assignments.parquet",
@@ -1928,6 +2017,7 @@ def build_event_scan_stage(
                     + "|"
                     + dna_joined["hit_strand"].astype(str)
                 )
+                dna_joined = assign_unique_peak_to_dna_hits(dna_joined)
                 source_parts.append(
                     dna_joined[
                         [
@@ -1938,6 +2028,7 @@ def build_event_scan_stage(
                             "chromosome", "start", "end", "strand", "motif_score",
                             "calibrated_motif_quality", "orientation", "peak_id",
                             "peak_support", "source_priority", "source_local_rank", "source_valid",
+                            "source_window_ids", "overlapping_peak_ids",
                         ]
                     ]
                 )
@@ -2636,19 +2727,57 @@ def merge_gate_gene_chunks(
 
 
 def _write_source_validation(paths: Mapping[str, Path], output: Path) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    status = subprocess.run(
+        ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise RuntimeError("real dataset build requires a committed src/fabric source tree")
+    source_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_paths = {
+        key: str(value) for key, value in paths.items() if key != "real_dataset"
+    }
+    destination = output / "SourceValidation.json"
+    if destination.is_file():
+        existing = json.loads(destination.read_text())
+        expected_identity = {
+            "source_git_commit": source_commit,
+            "sources": source_paths,
+            "expected_counts": EXPECTED,
+        }
+        if any(existing.get(key) != value for key, value in expected_identity.items()):
+            raise RuntimeError(
+                "real dataset build identity differs from the existing output root; "
+                "use a fresh output root"
+            )
+        return
+    if output.exists() and any(output.iterdir()):
+        raise RuntimeError(
+            "existing real dataset output lacks a current build identity; "
+            "use a fresh output root"
+        )
     output.mkdir(parents=True, exist_ok=True)
     record = {
-        "schema_version": "fabric.real_source_validation.v1",
+        "schema_version": "fabric.real_source_validation.v2",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "ADMITTED",
-        "sources": {key: str(value) for key, value in paths.items() if key != "real_dataset"},
+        "source_git_commit": source_commit,
+        "sources": source_paths,
         "expected_counts": EXPECTED,
         "historical_7198_graph_or_ec_used": False,
         "historical_167235_split_used": False,
         "test_compatible_rows_read": False,
         "test_predictions_or_metrics_computed": False,
     }
-    (output / "SourceValidation.json").write_text(json.dumps(record, indent=2) + "\n")
+    destination.write_text(json.dumps(record, indent=2) + "\n")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

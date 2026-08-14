@@ -164,8 +164,9 @@ def test_train_normalization_counts_unique_edges_only_and_drops_constant_columns
     assert audit["tss_core_promoter_score"].status == "constant_cis_feature"
     assert "annotation_confidence" not in transformed.column_names
     assert "tss_core_promoter_score" not in transformed.column_names
-    assert "edge_type__SPLICE" in transformed.column_names
-    assert "donor_strength_available" in transformed.column_names
+    train_design = transformed.values[:4]
+    design_with_bias = np.column_stack([np.ones(len(train_design)), train_design])
+    assert np.linalg.matrix_rank(design_with_bias) == design_with_bias.shape[1]
 
     raw_without_weights = build_explicit_cis_table(
         _edges(), _scores(_edges()), manifest=manifest
@@ -180,7 +181,30 @@ def test_train_normalization_counts_unique_edges_only_and_drops_constant_columns
 
 def test_frozen_normalization_applies_to_held_out_edges_without_clipping():
     manifest = _manifest()
-    raw = build_explicit_cis_table(_edges(), _scores(), manifest=manifest)
+    base_edges = _edges()
+    base_scores = _scores()
+    edge_rows = []
+    score_rows = []
+    for index in range(80):
+        edge = base_edges.iloc[index % len(base_edges)].to_dict()
+        score = base_scores.iloc[index % len(base_scores)].to_dict()
+        edge["edge_id"] = f"e{index}"
+        edge["target_gene_id"] = "g_train" if index < 79 else "g_val"
+        edge["span_bp"] = 100 + 7 * index
+        if edge["edge_type"] != "SPLICE":
+            edge["length_bp"] = edge["span_bp"] - 10
+        edge["relative_edge_pos"] = index / 79
+        edge["annotation_confidence"] = 0.5 + 0.002 * index
+        edge["edge_prior_score"] = np.cos(index / 9)
+        score["edge_id"] = edge["edge_id"]
+        score["edge_gc_fraction"] = 0.3 + 0.002 * index + 0.05 * np.sin(index)
+        edge_rows.append(edge)
+        score_rows.append(score)
+    score_rows[-1]["edge_gc_fraction"] = 0.95
+    edges = pd.DataFrame(edge_rows)
+    raw = build_explicit_cis_table(
+        edges, pd.DataFrame(score_rows), manifest=manifest
+    )
     fit = fit_cis_normalization(
         raw, train_admitted_gene_ids=["g_train"], manifest=manifest
     )
@@ -188,24 +212,26 @@ def test_frozen_normalization_applies_to_held_out_edges_without_clipping():
         raw,
         normalization=fit,
         manifest=manifest,
-        expected_edge_ids=["e0", "e1", "e2", "e3", "v0", "v1"],
+        expected_edge_ids=edges.edge_id.tolist(),
     ).to_frame()
 
-    gc_scale = np.std([0.2, 0.4, 0.6, 0.8], ddof=0)
-    assert normalized.loc[4, "edge_gc_fraction"] == pytest.approx(
-        (0.95 - 0.5) / gc_scale
+    train_gc = np.asarray(
+        [row["edge_gc_fraction"] for row in score_rows[:-1]], dtype=float
     )
-    assert normalized.loc[3, "donor_strength"] == 0.0
-    assert normalized.loc[3, "donor_strength_available"] == 0.0
-    np.testing.assert_array_equal(
-        normalized["edge_type__SPLICE"], [0, 1, 0, 0, 0, 0]
+    assert normalized.loc[79, "edge_gc_fraction"] == pytest.approx(
+        (0.95 - train_gc.mean()) / train_gc.std(ddof=0)
     )
+    assert set(normalized.columns) == {
+        "edge_id",
+        "target_gene_id",
+        *fit.model_output_order,
+    }
     with pytest.raises(ValueError, match="graph edge axis"):
         apply_cis_normalization(
             raw,
             normalization=fit,
             manifest=manifest,
-            expected_edge_ids=["e1", "e0", "e2", "e3", "v0", "v1"],
+            expected_edge_ids=["e1", "e0", *edges.edge_id.tolist()[2:]],
         )
 
 
@@ -261,9 +287,17 @@ def test_sequence_scores_fail_closed_on_value_semantic_violations(
 
 def test_sequence_masks_must_be_binary_and_match_endpoint_applicability():
     scores = _scores()
-    scores.loc[0, "donor_strength_available"] = False
-    with pytest.raises(ValueError, match="endpoint applicability"):
+    scores.loc[3, "donor_strength_available"] = True
+    with pytest.raises(ValueError, match="without endpoint applicability"):
         build_explicit_cis_table(_edges(), scores, manifest=_manifest())
+
+    scores = _scores()
+    scores.loc[0, "donor_strength_available"] = False
+    scores.loc[0, "donor_strength"] = 0.0
+    raw = build_explicit_cis_table(_edges(), scores, manifest=_manifest())
+    frame = raw.to_frame()
+    assert frame.loc[0, "donor_strength_available"] == 0.0
+    assert frame.loc[0, "donor_strength"] == 0.0
 
     scores = _scores()
     scores["donor_strength_available"] = scores[
@@ -303,7 +337,7 @@ def test_all_contract_continuous_fields_have_frozen_normalization_statistics():
         raw, train_admitted_gene_ids=["g_train"], manifest=manifest
     )
     assert tuple(row.feature_name for row in fit.statistics) == CONTINUOUS_FEATURES
-    assert fit.model_output_order == tuple(
+    constant_filtered_order = tuple(
         name
         for name in RAW_FEATURE_ORDER
         if name not in {
@@ -312,6 +346,14 @@ def test_all_contract_continuous_fields_have_frozen_normalization_statistics():
             if row.status.startswith("constant_cis_feature")
         }
     )
+    assert fit.model_output_order == tuple(
+        name for name in constant_filtered_order if name in fit.model_output_order
+    )
+    normalized = apply_cis_normalization(
+        raw, normalization=fit, manifest=manifest
+    ).values[:4]
+    design_with_bias = np.column_stack([np.ones(len(normalized)), normalized])
+    assert np.linalg.matrix_rank(design_with_bias) == design_with_bias.shape[1]
 
 
 def test_forged_raw_table_cannot_bypass_fit_or_apply_semantic_validation():

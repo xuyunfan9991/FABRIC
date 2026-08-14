@@ -728,7 +728,7 @@ def classify_model_injection_coverage(
     """Classify full versus partial exact-injection-class coverage."""
 
     if model_injection_index is None:
-        return (), (), "singleton_supported"
+        return (), (), "not_evaluated_missing_index"
     if model_injection_index.empty:
         if selected_route_ids:
             raise ValueError(

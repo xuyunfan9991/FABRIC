@@ -319,10 +319,11 @@ def build_explicit_cis_table(
         values = _finite_numeric(scores, feature, "precomputed CIS sequence scores")
         available = _binary_mask(scores, mask_name)
         expected = applicability[feature]
-        if not np.array_equal(available, expected):
-            differing = [edge_ids[index] for index in np.flatnonzero(available != expected)]
+        invalid_available = available & ~expected
+        if bool(invalid_available.any()):
+            differing = [edge_ids[index] for index in np.flatnonzero(invalid_available)]
             raise ValueError(
-                f"{mask_name} does not match endpoint applicability for edge_id "
+                f"{mask_name} is true without endpoint applicability for edge_id "
                 f"{differing}"
             )
         if bool((values[~available] != 0.0).any()):
@@ -406,7 +407,18 @@ def fit_cis_normalization(
                 status=status,
             )
         )
-    output_order = tuple(name for name in RAW_FEATURE_ORDER if name not in dropped)
+    candidate_output_order = tuple(name for name in RAW_FEATURE_ORDER if name not in dropped)
+    candidate_values = _normalized_cis_values(
+        raw_features,
+        column_names=candidate_output_order,
+        statistics=statistics,
+        numerical_tolerance=manifest.normalization.numerical_tolerance,
+    )
+    output_order = _select_full_rank_cis_columns(
+        candidate_values[train_row],
+        candidate_output_order,
+        numerical_tolerance=manifest.normalization.numerical_tolerance,
+    )
     train_edge_ids = tuple(
         sorted(
             edge_id
@@ -422,6 +434,72 @@ def fit_cis_normalization(
         model_output_order=output_order,
         numerical_tolerance=manifest.normalization.numerical_tolerance,
     )
+
+
+def _normalized_cis_values(
+    raw_features: RawCISFeatureTable,
+    *,
+    column_names: Sequence[str],
+    statistics: Sequence[CISNormalizationStatistic],
+    numerical_tolerance: float,
+) -> np.ndarray:
+    column_index = {name: index for index, name in enumerate(raw_features.column_names)}
+    statistic_by_name = {row.feature_name: row for row in statistics}
+    output: list[np.ndarray] = []
+    for feature in column_names:
+        values = raw_features.values[:, column_index[feature]].astype(np.float64)
+        if feature in CONTINUOUS_FEATURES:
+            statistic = statistic_by_name[feature]
+            if statistic.status != "retained" or (
+                statistic.standard_deviation <= numerical_tolerance
+            ):
+                raise RuntimeError("non-retained CIS feature entered the normalized design")
+            if statistic.availability_mask_name is None:
+                available = np.ones(len(values), dtype=bool)
+            else:
+                available = (
+                    raw_features.values[
+                        :, column_index[statistic.availability_mask_name]
+                    ]
+                    == 1.0
+                )
+            normalized = np.zeros(len(values), dtype=np.float64)
+            normalized[available] = (
+                values[available] - statistic.mean
+            ) / statistic.standard_deviation
+            values = normalized
+        output.append(values)
+    return np.column_stack(output)
+
+
+def _select_full_rank_cis_columns(
+    values: np.ndarray,
+    column_names: Sequence[str],
+    *,
+    numerical_tolerance: float,
+) -> tuple[str, ...]:
+    """Keep a stable full-rank CIS design in the presence of the model bias."""
+
+    matrix = np.asarray(values, dtype=np.float64)
+    names = tuple(map(str, column_names))
+    if matrix.ndim != 2 or matrix.shape[1] != len(names) or not len(matrix):
+        raise ValueError("CIS rank closure requires a nonempty aligned matrix")
+    retained: list[int] = []
+    intercept = np.ones(len(matrix), dtype=np.float64)
+    orthonormal = [intercept / np.linalg.norm(intercept)]
+    for column in range(matrix.shape[1]):
+        vector = matrix[:, column]
+        residual = vector.copy()
+        # A second pass prevents a nearly dependent column from borrowing
+        # numerical rank from accumulated roundoff.
+        for _ in range(2):
+            for basis in orthonormal:
+                residual -= np.dot(basis, residual) * basis
+        residual_norm = float(np.linalg.norm(residual))
+        if residual_norm > numerical_tolerance * max(float(np.linalg.norm(vector)), 1.0):
+            retained.append(column)
+            orthonormal.append(residual / residual_norm)
+    return tuple(names[index] for index in retained)
 
 
 def apply_cis_normalization(

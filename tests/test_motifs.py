@@ -10,6 +10,7 @@ from fabric.motifs import (
     EVENT_ROUTE_COLUMNS,
     PHYSICAL_EVENT_COLUMNS,
     _cap_route_decisions,
+    assign_unique_peak_to_dna_hits,
     build_candidate_routes,
     build_factor_catalog,
     build_graph_anchor_regions,
@@ -104,6 +105,7 @@ def test_factor_catalog_rejects_empty_or_duplicate_identity_members():
     }
     result = build_factor_catalog(pd.DataFrame(base), frozen_rna_gene_axis=["A", "B"])
     assert result.factors.iloc[0].activity_gene_ids == ["A", "B"]
+    assert result.motif_mapping.iloc[0].motif_equivalence_family_id == "M"
     for field, invalid in (
         ("candidate_factor_ids", [[]]),
         ("candidate_factor_ids", [["A", "A"]]),
@@ -114,6 +116,55 @@ def test_factor_catalog_rejects_empty_or_duplicate_identity_members():
         broken[field] = invalid
         with pytest.raises(ValueError, match="(non-empty and unique|unique and non-empty)"):
             build_factor_catalog(broken, frozen_rna_gene_axis=["A", "B"])
+
+
+def test_missing_motif_equivalence_families_remain_distinct_singletons():
+    rows = pd.DataFrame(
+        {
+            "modality": ["DNA", "DNA"],
+            "motif_id": ["M1", "M2"],
+            "motif_equivalence_family_id": [np.nan, None],
+            "factor_identity_kind": ["unique", "unique"],
+            "factor_entity_id": ["A", "A"],
+            "candidate_factor_ids": [["A"], ["A"]],
+            "activity_entity_id": ["A", "A"],
+            "activity_gene_ids": [["A"], ["A"]],
+            "activity_proxy_rule": [
+                "unique_gene_cp10k_log1p",
+                "unique_gene_cp10k_log1p",
+            ],
+        }
+    )
+    result = build_factor_catalog(rows, frozen_rna_gene_axis=["A"])
+    assert result.motif_mapping.set_index("motif_id")[
+        "motif_equivalence_family_id"
+    ].to_dict() == {"M1": "M1", "M2": "M2"}
+
+
+def test_dna_hit_has_one_peak_owner_and_preserves_all_window_provenance():
+    hits = pd.DataFrame(
+        [
+            _source_hit(
+                source_hit_id="low",
+                source_window_id="window:p1",
+                modality="DNA",
+                peak_id="p1",
+                peak_support=2.0,
+            ),
+            _source_hit(
+                source_hit_id="high",
+                source_window_id="window:p2",
+                modality="DNA",
+                peak_id="p2",
+                peak_support=5.0,
+            ),
+        ]
+    )
+    assigned = assign_unique_peak_to_dna_hits(hits)
+    assert len(assigned) == 1
+    assert assigned.iloc[0].peak_id == "p2"
+    assert assigned.iloc[0].source_window_ids == ["window:p1", "window:p2"]
+    assert assigned.iloc[0].overlapping_peak_ids == ["p1", "p2"]
 
 
 def _source_hit(**updates):
@@ -318,8 +369,8 @@ def test_site_route_geometry_has_strict_overlap_na_touch_and_negative_half_cente
     ].iloc[0]
     assert overlap.transcript_oriented_side == "OVERLAP_ANCHOR"
     assert np.isnan(overlap.signed_distance_bp)
-    assert starts_at_anchor.transcript_oriented_side == "OVERLAP_ANCHOR"
-    assert np.isnan(starts_at_anchor.signed_distance_bp)
+    assert starts_at_anchor.transcript_oriented_side == "DOWNSTREAM"
+    assert starts_at_anchor.signed_distance_bp == 3.0
     assert touch.transcript_oriented_side == "UPSTREAM"
     assert touch.signed_distance_bp == -1.0
     assert negative.transcript_oriented_side == "UPSTREAM"

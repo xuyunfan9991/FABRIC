@@ -16,7 +16,8 @@ import itertools
 import json
 import math
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+import subprocess
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -28,13 +29,16 @@ from scipy import linalg, sparse
 
 from .dataset import (
     GateValues,
+    InteractionDesign,
     ProductionModalityTensors,
+    RouteBaseDesign,
     _route_context_levels,
     assemble_gene_cell_model_input,
     build_event_feature_manifest,
+    build_model_injection_equivalence_index,
 )
-from .graph import GraphTables, build_gene_graph
-from .train import PreparedGene, prepared_gene_from_assembly
+from .graph import build_gene_graph
+from .train import prepared_gene_from_assembly
 
 
 CHROMOSOMES = tuple([f"chr{value}" for value in range(1, 23)] + ["chrX", "chrY"])
@@ -51,6 +55,35 @@ INTERACTION_SUPPORT_THRESHOLDS = {
     }
     for modality in ("DNA", "RNA")
 }
+
+
+def _clean_source_commit() -> str:
+    repository = Path(__file__).resolve().parents[2]
+    status = subprocess.run(
+        ["git", "-C", str(repository), "status", "--porcelain", "--", "src/fabric"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise RuntimeError("real prepared artifacts require a committed src/fabric source tree")
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _validated_real_dataset_source(root: Path) -> tuple[str, str]:
+    identity_path = root / "SourceValidation.json"
+    if not identity_path.is_file():
+        raise FileNotFoundError("real dataset SourceValidation.json is absent")
+    identity = json.loads(identity_path.read_text())
+    source_commit = _clean_source_commit()
+    if identity.get("source_git_commit") != source_commit:
+        raise RuntimeError("real dataset source commit differs from the current source")
+    return source_commit, str(identity["created_at_utc"])
 
 
 @dataclass(frozen=True)
@@ -171,7 +204,6 @@ def _encode_candidate_base(
             values.append(vector[selected].astype(np.float64, copy=False))
 
     factors = frame["interaction_factor_id"].astype(str).to_numpy()
-    geometry = frame["geometry_kind"].astype(str).to_numpy()
     signed = frame["signed_distance_bp"].to_numpy(np.float64)
     edge_relative = frame["edge_relative_position"].to_numpy(np.float64)
     d5 = frame["distance_to_5prime_boundary_bp"].to_numpy(np.float64)
@@ -1021,60 +1053,30 @@ def build_real_interaction_basis(real_root: str | Path) -> None:
     )
 
 
-class _GF2RowRank:
-    """Compact exact row-rank certificate over GF(2)."""
-
-    def __init__(self) -> None:
-        self.pivots: dict[int, int] = {}
-
-    def add(self, bits: int) -> bool:
-        value = int(bits)
-        while value:
-            lowest = value & -value
-            pivot = lowest.bit_length() - 1
-            if pivot not in self.pivots:
-                self.pivots[pivot] = value
-                return True
-            value ^= self.pivots[pivot]
-        return False
-
-    @property
-    def rank(self) -> int:
-        return len(self.pivots)
-
-
-def _select_gf2_independent_columns(
-    independent_rows: Sequence[int],
+def _select_exact_integer_columns(
+    integer_rows: Sequence[Sequence[tuple[int, int]]],
     *,
     width: int,
     required_prefix_width: int,
 ) -> tuple[tuple[int, ...], int]:
-    """Keep a fixed required prefix, then greedily close GF(2) column rank."""
+    """Keep a fixed prefix, then close signed integer rank over the rationals."""
 
-    if not independent_rows or not 0 <= required_prefix_width <= width:
-        raise ValueError("invalid independent-row column-selection dimensions")
-    packed_width = (width + 7) // 8
-    packed_rows = np.frombuffer(
-        b"".join(
-            int(value).to_bytes(packed_width, byteorder="little", signed=False)
-            for value in independent_rows
-        ),
-        dtype=np.uint8,
-    ).reshape(len(independent_rows), packed_width)
-    dense = np.unpackbits(packed_rows, axis=1, bitorder="little")[:, :width]
-    basis = _GF2RowRank()
+    if not integer_rows or not 0 <= required_prefix_width <= width:
+        raise ValueError("invalid exact-integer column-selection dimensions")
+    columns: list[dict[int, int]] = [dict() for _ in range(width)]
+    for row_index, entries in enumerate(integer_rows):
+        for column, value in entries:
+            if not 0 <= int(column) < width or not int(value):
+                raise ValueError("exact integer row contains an invalid sparse entry")
+            columns[int(column)][row_index] = int(value)
+    basis = _ExactRectangleBasis()
     retained: list[int] = []
     for column in range(width):
-        column_bits = int.from_bytes(
-            np.packbits(dense[:, column], bitorder="little").tobytes(),
-            byteorder="little",
-            signed=False,
-        )
-        independent = basis.add(column_bits)
+        independent = basis.add_if_independent(columns[column])
         if column < required_prefix_width:
             if not independent:
                 raise ValueError(
-                    "required integer base block is not full rank over GF(2)"
+                    "required integer base block is not full rank over the rationals"
                 )
             retained.append(column)
         elif independent:
@@ -1100,10 +1102,10 @@ def _support_interaction_columns(
 def audit_production_route_design(real_root: str | Path) -> None:
     """Certify combined base/interaction rank on all model-active routes.
 
-    Integer categorical and canonical rectangle columns receive an exact GF(2)
-    full-rank certificate, which implies full rank over the rationals.  The
-    small continuous block is then certified by an SVD of within-identical-
-    integer-design contrasts, so it cannot borrow rank from categorical terms.
+    Integer categorical and signed canonical rectangle columns receive an exact
+    fraction-free rational-rank certificate.  The small continuous block is
+    then certified by an SVD of within-identical-integer-design contrasts, so it
+    cannot borrow rank from categorical terms.
     """
 
     root = Path(real_root)
@@ -1139,12 +1141,13 @@ def audit_production_route_design(real_root: str | Path) -> None:
         if len(set(support_interaction.tolist())) != len(support_interaction):
             raise ValueError(f"{modality} support interaction columns are duplicated")
         candidate_integer_width = len(integer_base) + len(support_interaction)
-        rank = _GF2RowRank()
-        independent_rows: list[int] = []
+        integer_rows: list[tuple[tuple[int, int], ...]] = []
+        integer_row_set: set[tuple[tuple[int, int], ...]] = set()
+        integer_row_basis = _ExactRectangleBasis()
+        unique_integer_rows_examined = 0
         continuous_differences: list[np.ndarray] = []
         continuous_rank = 0
         production_route_rows_examined = 0
-        unique_integer_rows_examined = 0
         for chromosome in CHROMOSOMES:
             physical = pd.read_parquet(
                 root / "events" / "gated" / "physical_events" / f"part-{chromosome}.parquet"
@@ -1194,16 +1197,19 @@ def audit_production_route_design(real_root: str | Path) -> None:
                 start, end = integer_matrix.indptr[row : row + 2]
                 indices = integer_matrix.indices[start:end]
                 values = integer_matrix.data[start:end]
-                bits = 0
+                entries: list[tuple[int, int]] = []
                 for column, value in zip(indices, values, strict=True):
                     rounded = int(round(float(value)))
                     if not np.isclose(value, rounded, atol=1.0e-7, rtol=0):
                         raise ValueError("integer production design contains a non-integer value")
-                    if rounded % 2:
-                        bits |= 1 << int(column)
-                if rank.add(bits):
-                    independent_rows.append(bits)
-                unique_integer_rows_examined += 1
+                    if rounded:
+                        entries.append((int(column), rounded))
+                identity = tuple(sorted(entries))
+                if identity not in integer_row_set:
+                    integer_row_set.add(identity)
+                    unique_integer_rows_examined += 1
+                    if integer_row_basis.add_if_independent(dict(identity)):
+                        integer_rows.append(identity)
             if len(continuous_base) and continuous_rank < len(continuous_base):
                 # Continuous columns may only claim rank that cannot be
                 # borrowed from the integer design.  Differences between real
@@ -1237,22 +1243,17 @@ def audit_production_route_design(real_root: str | Path) -> None:
                             break
                     if continuous_rank == len(continuous_base):
                         break
-            if (
-                rank.rank == candidate_integer_width
-                and continuous_rank == len(continuous_base)
-            ):
-                break
         if continuous_rank != len(continuous_base):
             raise ValueError(
                 f"{modality} continuous base block adds only {continuous_rank}/{len(continuous_base)} ranks"
             )
-        retained_columns, candidate_rank = _select_gf2_independent_columns(
-            independent_rows,
+        retained_columns, candidate_rank = _select_exact_integer_columns(
+            integer_rows,
             width=candidate_integer_width,
             required_prefix_width=len(integer_base),
         )
-        if candidate_rank != rank.rank:
-            raise RuntimeError("row-rank and column-rank certificates disagree")
+        if candidate_rank != integer_row_basis.rank:
+            raise RuntimeError("exact row-rank and column-rank certificates disagree")
         retained_interaction_positions = tuple(
             value - len(integer_base)
             for value in retained_columns
@@ -1263,7 +1264,7 @@ def audit_production_route_design(real_root: str | Path) -> None:
             for position in retained_interaction_positions
         )
         final_integer_width = len(integer_base) + len(active_interaction)
-        if final_integer_width != rank.rank:
+        if final_integer_width != candidate_rank:
             raise RuntimeError("combined integer design did not close to exact rank")
         active_set = set(active_interaction)
         active_mask = np.zeros(int(modality_manifest["padded_width"]), dtype=bool)
@@ -1308,6 +1309,7 @@ def audit_production_route_design(real_root: str | Path) -> None:
             "unique_integer_route_rows_examined_for_certificate": (
                 unique_integer_rows_examined
             ),
+            "independent_integer_route_rows_in_certificate": len(integer_rows),
             "integer_row_deduplication_identity": (
                 "interaction_factor_all_base_categorical_fields_and_all_"
                 "continuous_availability_masks"
@@ -1315,7 +1317,7 @@ def audit_production_route_design(real_root: str | Path) -> None:
             "candidate_integer_column_count_before_combined_closure": (
                 candidate_integer_width
             ),
-            "candidate_exact_GF2_rank": rank.rank,
+            "candidate_exact_rational_rank": candidate_rank,
             "integer_base_column_count": len(integer_base),
             "support_interaction_column_count": len(support_interaction),
             "rank_redundant_support_interaction_column_count": (
@@ -1323,8 +1325,8 @@ def audit_production_route_design(real_root: str | Path) -> None:
             ),
             "active_interaction_column_count": len(active_interaction),
             "final_integer_column_count": final_integer_width,
-            "final_exact_GF2_rank": final_integer_width,
-            "exact_GF2_full_rank_implies_rational_full_rank": True,
+            "final_exact_rational_rank": final_integer_width,
+            "signed_interaction_values_preserved": True,
             "continuous_column_count": len(continuous_base),
             "within_identical_integer_design_continuous_rank": continuous_rank,
             "continuous_difference_singular_values": difference_singular,
@@ -1517,6 +1519,87 @@ def _production_modality_tensors(
     )
 
 
+def _gene_model_injection_index(
+    physical: pd.DataFrame,
+    routes: pd.DataFrame,
+    *,
+    ordered_edge_ids: Sequence[str],
+    dna: ProductionModalityTensors,
+    rna: ProductionModalityTensors,
+    base_manifest: Mapping[str, object],
+    interaction_manifest: Mapping[str, object],
+) -> pd.DataFrame:
+    route_ids = dna.route_ids + rna.route_ids
+    dna_names = tuple(
+        str(value["name"])
+        for value in base_manifest["modalities"]["DNA"]["retained_specs"]
+    )
+    rna_names = tuple(
+        str(value["name"])
+        for value in base_manifest["modalities"]["RNA"]["retained_specs"]
+    )
+    base_values = np.zeros((len(route_ids), len(dna_names) + len(rna_names)), dtype=np.float32)
+    dna_base = (
+        dna.route_base_features.toarray()
+        if sparse.issparse(dna.route_base_features)
+        else np.asarray(dna.route_base_features)
+    )
+    rna_base = (
+        rna.route_base_features.toarray()
+        if sparse.issparse(rna.route_base_features)
+        else np.asarray(rna.route_base_features)
+    )
+    base_values[: len(dna.route_ids), : len(dna_names)] = dna_base
+    base_values[len(dna.route_ids) :, len(dna_names) :] = rna_base
+    route_base = RouteBaseDesign(
+        route_ids=route_ids,
+        values=base_values,
+        column_names=dna_names + rna_names,
+        manifest=base_manifest,
+        route_context=pd.DataFrame(),
+    )
+    dna_interaction = (
+        dna.route_interaction_features.toarray()
+        if sparse.issparse(dna.route_interaction_features)
+        else np.asarray(dna.route_interaction_features)
+    )
+    rna_interaction = (
+        rna.route_interaction_features.toarray()
+        if sparse.issparse(rna.route_interaction_features)
+        else np.asarray(rna.route_interaction_features)
+    )
+    interaction = InteractionDesign(
+        route_ids=route_ids,
+        values_by_modality={"DNA": dna_interaction, "RNA": rna_interaction},
+        active_mask_by_modality={
+            "DNA": dna.interaction_active_mask,
+            "RNA": rna.interaction_active_mask,
+        },
+        route_indices_by_modality={
+            "DNA": np.arange(len(dna.route_ids), dtype=np.int64),
+            "RNA": np.arange(
+                len(dna.route_ids), len(route_ids), dtype=np.int64
+            ),
+        },
+        raw_support=pd.DataFrame(),
+        manifest=interaction_manifest,
+        raw_contrasts=pd.DataFrame(),
+    )
+    gene_ids = set(physical["target_gene_id"].astype(str))
+    if len(gene_ids) > 1:
+        raise ValueError("model injection index input mixes genes")
+    if not gene_ids:
+        return pd.DataFrame()
+    gene_id = next(iter(gene_ids))
+    return build_model_injection_equivalence_index(
+        physical,
+        routes,
+        route_base,
+        interaction,
+        ordered_edge_ids_by_gene={gene_id: tuple(map(str, ordered_edge_ids))},
+    )
+
+
 def build_prepared_chromosome(
     real_root: str | Path,
     compatible_root: str | Path,
@@ -1602,6 +1685,7 @@ def build_prepared_chromosome(
     shard_root = root / "prepared_dataset" / "genes" / chromosome
     shard_root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, object]] = []
+    injection_rows: list[pd.DataFrame] = []
     for local_index, gene_id in enumerate(selected_genes):
         missing = [name for name in ("nodes", "edges", "paths", "path_edges", "cis", "ec") if gene_id not in groups[name]]
         if missing:
@@ -1654,6 +1738,17 @@ def build_prepared_chromosome(
             base_manifest=base_manifest,
             interaction_manifest=interaction_manifest,
         )
+        gene_injection_index = _gene_model_injection_index(
+            gene_physical,
+            gene_routes,
+            ordered_edge_ids=gene_graph.edge_ids,
+            dna=dna,
+            rna=rna,
+            base_manifest=base_manifest,
+            interaction_manifest=interaction_manifest,
+        )
+        if not gene_injection_index.empty:
+            injection_rows.append(gene_injection_index)
         assembly = assemble_gene_cell_model_input(
             gene_graph,
             cell_split=pd.DataFrame({"cell_id": cell_ids, "split": splits}),
@@ -1692,12 +1787,37 @@ def build_prepared_chromosome(
             print(f"prepared {chromosome}: {local_index + 1}/{len(selected_genes)} genes", flush=True)
     manifest_root = root / "prepared_dataset" / "shard_manifests"
     manifest_root.mkdir(parents=True, exist_ok=True)
+    reporting_root = root / "reporting" / "model_injection_equivalence"
+    reporting_root.mkdir(parents=True, exist_ok=True)
+    injection_index = (
+        pd.concat(injection_rows, ignore_index=True)
+        if injection_rows
+        else pd.DataFrame()
+    )
+    if injection_index.empty:
+        raise ValueError(f"model injection equivalence index is empty for {chromosome}")
+    expected_injection_events = sum(
+        int(value["dna_active_event_count"]) + int(value["rna_active_event_count"])
+        for value in records
+    )
+    if int(injection_index["member_count"].sum()) != expected_injection_events:
+        raise ValueError(
+            f"model injection equivalence index does not cover every active event on {chromosome}"
+        )
+    injection_index.to_parquet(
+        reporting_root / f"part-{chromosome}.parquet", index=False
+    )
     record = {
         "schema_version": "fabric.prepared_chromosome_shard.v1",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "chromosome": chromosome,
         "gene_count": len(records),
         "gene_records": records,
+        "model_injection_group_count": len(injection_index),
+        "model_injection_event_count": int(injection_index["member_count"].sum()),
+        "model_injection_equivalence_index": str(
+            (reporting_root / f"part-{chromosome}.parquet").relative_to(root)
+        ),
         "test_compatible_rows": 0,
         "test_predictions_or_metrics_computed": False,
     }
@@ -1740,7 +1860,6 @@ def finalize_backed_prepared_dataset(
         )
         if set(ec["split"].astype(str)) - {"train", "val"}:
             raise ValueError("finalize compatibility rows contain test")
-        genes = ec["target_gene_id"].astype(str)
         for split in ("train", "val"):
             split_rows = ec.loc[ec["split"].astype(str).eq(split)]
             split_genes = split_rows["target_gene_id"].astype(str)
@@ -1769,11 +1888,17 @@ def finalize_backed_prepared_dataset(
     actual_total = sum(int(value["informative_molecule_mass"]) for value in records)
     if actual_total != expected_mass["train"] + expected_mass["val"]:
         raise ValueError("prepared molecule mass differs from G_fit K^inf mass")
+    created_at = datetime.now(timezone.utc).isoformat()
+    source_commit, input_instance = _validated_real_dataset_source(root)
+    compatibility_instance = str(upstream["created_at_utc"])
     manifest = {
         "schema_version": "fabric.backed_prepared_dataset.v1",
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "input_manifest_id": "fabric_v2_real_dataset_v1",
-        "compatibility_artifact_id": "fabric_v2_compatible_ec_v1",
+        "created_at_utc": created_at,
+        "source_git_commit": source_commit,
+        "input_manifest_id": f"fabric_v2_real_dataset@{input_instance}",
+        "compatibility_artifact_id": (
+            f"fabric_v2_compatible_ec@{compatibility_instance}"
+        ),
         "informative_gene_ids": list(g_fit),
         "gene_shards": [
             {"gene_id": value["gene_id"], "relative_path": value["relative_path"]}
@@ -1818,6 +1943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = _load_external_paths(args.external_inputs)
     real_root = paths["real_dataset"]
     compatible_root = paths["compatible_ec"]
+    _validated_real_dataset_source(real_root)
     if args.stage == "feature-design":
         build_split_neutral_feature_design(real_root)
     elif args.stage == "raw-support":
