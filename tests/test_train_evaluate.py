@@ -588,12 +588,15 @@ def test_route_audit_manifest_freezes_generator_seeds_and_all_tolerances():
 def test_full_cohort_guard_fails_before_data_gpu_or_run_directory(tmp_path):
     config = load_config("configs/fabric_v2_full_cohort.yaml")
     assert config["execution"]["scope"] == FULL_COHORT_SCOPE
+    config["execution"]["training_authorized"] = False
+    unauthorized_config = tmp_path / "unauthorized.yaml"
+    unauthorized_config.write_text(yaml.safe_dump(config, sort_keys=False))
     run_dir = tmp_path / "must_not_exist"
     with pytest.raises(RuntimeError, match="training is not authorized"):
         main(
             [
                 "--config",
-                "configs/fabric_v2_full_cohort.yaml",
+                str(unauthorized_config),
                 "--run-dir",
                 str(run_dir),
                 "--device",

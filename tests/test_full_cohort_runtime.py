@@ -51,7 +51,7 @@ def test_full_cohort_config_is_single_run_and_test_blind():
     config = load_config("configs/fabric_v2_full_cohort.yaml")
     assert config["execution"] == {
         "scope": FULL_COHORT_SCOPE,
-        "training_authorized": False,
+        "training_authorized": True,
         "final_test_authorized": False,
     }
     manifest = training_manifest_from_config(config, seed=1103, condition="full")
@@ -78,8 +78,11 @@ def test_full_cohort_config_is_single_run_and_test_blind():
     assert manifest.prefetch_backed_gene_shards is True
     assert manifest.compute_precision == "float32_highest"
     assert "max_attention_elements_per_batch" not in config["resources"]
+    assert_execution_admitted(config)
+    unauthorized = deepcopy(config)
+    unauthorized["execution"]["training_authorized"] = False
     with pytest.raises(RuntimeError, match="training is not authorized"):
-        assert_execution_admitted(config)
+        assert_execution_admitted(unauthorized)
 
     genes = make_toy_genes()
     fixture = load_config("configs/fabric_v2_toy.yaml")
