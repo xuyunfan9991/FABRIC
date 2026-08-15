@@ -1,9 +1,9 @@
 contract: FABRIC_ARCHITECTURE_V2
-status: READY_AWAITING_TRAINING_AUTHORIZATION
+status: READY_TO_LAUNCH_FULL_COHORT_RUN
 
 execution:
   scope: full_cohort
-  training_authorized: false
+  training_authorized: true
   final_test_authorized: false
 
 inputs:
