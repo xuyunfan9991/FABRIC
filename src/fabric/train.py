@@ -3769,14 +3769,12 @@ def _training_recovery_identity(
     source_commit = _runtime_source_commit(
         require_clean=config["execution"]["scope"] == FULL_COHORT_SCOPE
     )
-    if (
-        config["execution"]["scope"] == FULL_COHORT_SCOPE
-        and isinstance(prepared, BackedPreparedDataset)
-        and prepared.source_git_commit != source_commit
-    ):
-        raise RuntimeError(
-            "full-cohort prepared artifact source commit differs from the training source"
-        )
+    # The artifact's build commit and the training-source commit are both
+    # recorded below, but equality is no longer enforced (user decision,
+    # 2026-08-18): a training-side src/fabric change would otherwise force a
+    # byte-identical dataset rebuild.  Auditors can diff the two commits
+    # recorded in every run identity to confirm the artifact-producing code
+    # was untouched.
     return {
         "training_run_manifest": asdict(manifest),
         "resolved_config": copy.deepcopy(dict(config)),
@@ -3788,6 +3786,11 @@ def _training_recovery_identity(
             prepared.compatibility_artifact_id if prepared is not None else None
         ),
         "source_git_commit": source_commit,
+        "prepared_source_git_commit": (
+            prepared.source_git_commit
+            if isinstance(prepared, BackedPreparedDataset)
+            else None
+        ),
         "ordered_gene_ids": ordered_gene_ids,
         "model_spec": _model_spec(genes[0], config["model"]),
         "readout_kind": "path_context",
