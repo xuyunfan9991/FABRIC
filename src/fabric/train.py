@@ -45,6 +45,12 @@ if __name__ == "__main__":
 SPLITS = ("train", "val", "test")
 FULL_COHORT_SCOPE = "full_cohort"
 RUN_CONDITIONS = ("full", "atac", "rbp")
+# Between-gene weighting of the training objective.  molecule_weighted is the
+# original global molecule-mass average; gene_macro normalizes each gene step
+# by that gene's own full-train molecule mass so every gene carries equal
+# weight (B2 variant 2).  Within-gene weighting stays molecule-weighted in
+# both modes, and checkpoint selection follows the matching validation metric.
+GENE_OBJECTIVES = ("molecule_weighted", "gene_macro")
 _MODEL_CONDITION = {"full": "full", "atac": "cis_dna", "rbp": "cis_rna"}
 
 
@@ -280,12 +286,15 @@ class TrainingRunManifest:
     max_cells_per_gpu_batch: int
     prefetch_backed_gene_shards: bool
     compute_precision: str
+    gene_objective: str = "molecule_weighted"
 
     def validate(self) -> None:
         if type(self.seed) is not int:
             raise TypeError("TrainingRunManifest seed must be an integer")
         if self.condition not in RUN_CONDITIONS:
             raise ValueError(f"run condition must be one of {RUN_CONDITIONS}")
+        if self.gene_objective not in GENE_OBJECTIVES:
+            raise ValueError(f"gene_objective must be one of {GENE_OBJECTIVES}")
         if (
             isinstance(self.learning_rate, bool)
             or not isinstance(self.learning_rate, (int, float))
@@ -1310,10 +1319,22 @@ class ValidationSnapshot:
     weighted_nll_sum: float
     informative_molecule_mass: float
     predictions: tuple[ValidationPrediction, ...]
+    # (gene_id, weighted_nll_sum, molecule_mass) per informative gene, from the
+    # same traversal that produced weighted_nll_sum -- no extra forward pass.
+    per_gene_nll: tuple[tuple[str, float, float], ...] = ()
 
     @property
     def nll(self) -> float:
         return self.weighted_nll_sum / self.informative_molecule_mass
+
+    @property
+    def gene_macro_nll(self) -> float:
+        """Equal-weight mean over genes of within-gene molecule-weighted NLL."""
+        if not self.per_gene_nll:
+            raise ValueError("snapshot carries no per-gene NLL decomposition")
+        return float(
+            np.mean([weighted / mass for _, weighted, mass in self.per_gene_nll])
+        )
 
 
 @dataclass(frozen=True)
@@ -1911,6 +1932,7 @@ def training_manifest_from_config(
         max_cells_per_gpu_batch=int(resources["max_cells_per_gpu_batch"]),
         prefetch_backed_gene_shards=resources["prefetch_backed_gene_shards"],
         compute_precision=str(resources["compute_precision"]),
+        gene_objective=str(training.get("gene_objective", "molecule_weighted")),
     )
     manifest.validate()
     return manifest
@@ -2483,12 +2505,29 @@ def train_run(
                 else partial(_reconcile_recovery_artifacts, run_path)
             ),
         )
+        best_history_row = result.history.loc[
+            result.history["epoch"] == result.best_epoch
+        ].iloc[0]
         metric_rows = [
             {
                 "seed": seed,
                 "condition": condition,
                 "split": "val",
-                "validation_compatible_path_nll": result.best_validation_nll,
+                "validation_compatible_path_nll": float(
+                    best_history_row["validation_compatible_path_nll"]
+                ),
+                "validation_compatible_path_nll_gene_macro": (
+                    float(best_history_row["validation_compatible_path_nll_gene_macro"])
+                    if pd.notna(
+                        best_history_row["validation_compatible_path_nll_gene_macro"]
+                    )
+                    else None
+                ),
+                "gene_objective": str(best_history_row["gene_objective"]),
+                "checkpoint_selection_metric": str(
+                    best_history_row["checkpoint_selection_metric"]
+                ),
+                "checkpoint_selection_value": result.best_validation_nll,
                 "ont_matrix_kl_count_weighted": (
                     result.best_ont_matrix_kl_count_weighted
                 ),
@@ -2604,6 +2643,17 @@ def _fit_condition(
     if total_train_mass <= 0:
         raise ValueError("training split has zero likelihood-informative molecule mass")
     train_positive_gene_count = len(genes)
+    gene_objective = str(training.get("gene_objective", "molecule_weighted"))
+    if gene_objective not in GENE_OBJECTIVES:
+        raise ValueError(f"training.gene_objective must be one of {GENE_OBJECTIVES}")
+    selection_metric_name = (
+        "validation_compatible_path_nll_gene_macro"
+        if gene_objective == "gene_macro"
+        else "validation_compatible_path_nll"
+    )
+    # Full-train molecule mass per gene; constant across epochs, cached on
+    # first touch so backed shards are not re-read for the normalizer.
+    gene_train_mass_cache: dict[str, float] = {}
     validation_mass = split_informative_molecule_mass(genes, "val")
     if validation_mass <= 0:
         raise ValueError(
@@ -2632,6 +2682,7 @@ def _fit_condition(
             max_epochs=max_epochs,
             patience=patience,
             monitor_enabled=monitor_callback is not None,
+            selection_metric=selection_metric_name,
         )
         completed_epoch = restored["completed_epoch"]
         history_rows = restored["history_rows"]
@@ -2728,12 +2779,34 @@ def _fit_condition(
                     row_cell_index=row_cell_index,
                     return_details=True,
                 )
-                (
-                    details.weighted_sum
-                    * train_positive_gene_count
-                    * inclusion_multiplier
-                    / total_train_mass
-                ).backward()
+                if gene_objective == "gene_macro":
+                    gene_train_mass = gene_train_mass_cache.get(gene.gene_id)
+                    if gene_train_mass is None:
+                        gene_train_mass = split_informative_molecule_mass(
+                            (gene,), "train"
+                        )
+                        if gene_train_mass <= 0:
+                            raise ValueError(
+                                f"G_fit gene {gene.gene_id} has zero train "
+                                "molecule mass"
+                            )
+                        gene_train_mass_cache[gene.gene_id] = gene_train_mass
+                    # Unbiased estimate of this gene's own mean NLL: the HT
+                    # inclusion multiplier restores the full-train weighted sum
+                    # and the gene's full-train mass normalizes it, so every
+                    # gene contributes one equally scaled step (B2 variant 2).
+                    (
+                        details.weighted_sum
+                        * inclusion_multiplier
+                        / gene_train_mass
+                    ).backward()
+                else:
+                    (
+                        details.weighted_sum
+                        * train_positive_gene_count
+                        * inclusion_multiplier
+                        / total_train_mass
+                    ).backward()
             _assert_finite_gradients(
                 model,
                 require_all=False,
@@ -2765,6 +2838,21 @@ def _fit_condition(
             resources=config["resources"],
         )
         val_nll = validation_snapshot.nll
+        # Stubbed snapshots (tests) may omit the decomposition; only the macro
+        # objective strictly requires it.
+        val_gene_macro_nll = (
+            validation_snapshot.gene_macro_nll
+            if validation_snapshot.per_gene_nll
+            else None
+        )
+        if gene_objective == "gene_macro":
+            if val_gene_macro_nll is None:
+                raise ValueError(
+                    "gene_macro objective requires per-gene validation NLL"
+                )
+            selection_value = val_gene_macro_nll
+        else:
+            selection_value = val_nll
         ont_matrix_kl: float | None = None
         # The callback consumes predictions from this same validation traversal.
         # It cannot enter checkpoint selection or trigger another model forward.
@@ -2783,11 +2871,11 @@ def _fit_condition(
                 )
             )
         if lr_scheduler is not None:
-            lr_scheduler.step(val_nll)
+            lr_scheduler.step(selection_value)
         next_epoch_learning_rate = _optimizer_learning_rate(optimizer)
-        best_improved = val_nll < best_nll
+        best_improved = selection_value < best_nll
         if best_improved:
-            best_nll = val_nll
+            best_nll = selection_value
             best_ont_matrix_kl = ont_matrix_kl
             best_epoch = epoch
             best_state = _cpu_copy(model.state_dict())
@@ -2809,6 +2897,9 @@ def _fit_condition(
                 "lr_scheduler": optimizer_config["lr_scheduler"]["name"],
                 "gradient_clip_norm": gradient_clip_norm,
                 "validation_compatible_path_nll": val_nll,
+                "validation_compatible_path_nll_gene_macro": val_gene_macro_nll,
+                "gene_objective": gene_objective,
+                "checkpoint_selection_metric": selection_metric_name,
                 "ont_matrix_kl_count_weighted": ont_matrix_kl,
                 "epoch_train_denominator": total_train_mass,
                 "validation_informative_molecule_mass": validation_mass,
@@ -2847,6 +2938,7 @@ def _fit_condition(
                     ),
                     "best_epoch": best_epoch,
                     "best_validation_nll": best_nll,
+                    "checkpoint_selection_metric": selection_metric_name,
                     "best_ont_matrix_kl_count_weighted": best_ont_matrix_kl,
                     "best_model_state_dict": best_state,
                     "best_optimizer_state_dict": best_optimizer_state,
@@ -2931,6 +3023,7 @@ def _evaluate_split(
     total_weighted = 0.0
     total_mass = 0.0
     predictions: list[ValidationPrediction] = []
+    per_gene_nll: list[tuple[str, float, float]] = []
     with torch.no_grad():
         for _, gene in _iter_gene_order(
             genes,
@@ -2950,6 +3043,8 @@ def _evaluate_split(
                 phase="evaluation",
             )
             path_logits_parts: list[torch.Tensor] = []
+            gene_weighted = 0.0
+            gene_mass = 0.0
             for cell_batch in batch_plan.batches:
                 cell_mask = torch.isin(gene.row_cell_index[rows], cell_batch)
                 batch_rows = rows[cell_mask]
@@ -2967,6 +3062,8 @@ def _evaluate_split(
                 )
                 total_weighted += float(details.weighted_sum)
                 total_mass += float(details.molecule_mass)
+                gene_weighted += float(details.weighted_sum)
+                gene_mass += float(details.molecule_mass)
                 path_logits_parts.append(output.path_logits.detach().cpu())
             path_logits = torch.cat(path_logits_parts, dim=0)
             lookup = torch.full((len(gene.cell_ids),), -1, dtype=torch.long)
@@ -2974,6 +3071,8 @@ def _evaluate_split(
             combined_row_cell_index = lookup[gene.row_cell_index[rows].cpu()]
             if bool((combined_row_cell_index < 0).any()):
                 raise AssertionError("evaluation EC row was not assigned to its cell")
+            if gene_mass > 0:
+                per_gene_nll.append((gene.gene_id, gene_weighted, gene_mass))
             predictions.append(
                 ValidationPrediction(
                     gene_id=gene.gene_id,
@@ -2993,6 +3092,7 @@ def _evaluate_split(
         weighted_nll_sum=total_weighted,
         informative_molecule_mass=total_mass,
         predictions=tuple(predictions),
+        per_gene_nll=tuple(per_gene_nll),
     )
 
 
@@ -3669,14 +3769,12 @@ def _training_recovery_identity(
     source_commit = _runtime_source_commit(
         require_clean=config["execution"]["scope"] == FULL_COHORT_SCOPE
     )
-    if (
-        config["execution"]["scope"] == FULL_COHORT_SCOPE
-        and isinstance(prepared, BackedPreparedDataset)
-        and prepared.source_git_commit != source_commit
-    ):
-        raise RuntimeError(
-            "full-cohort prepared artifact source commit differs from the training source"
-        )
+    # The artifact's build commit and the training-source commit are both
+    # recorded below, but equality is no longer enforced (user decision,
+    # 2026-08-18): a training-side src/fabric change would otherwise force a
+    # byte-identical dataset rebuild.  Auditors can diff the two commits
+    # recorded in every run identity to confirm the artifact-producing code
+    # was untouched.
     return {
         "training_run_manifest": asdict(manifest),
         "resolved_config": copy.deepcopy(dict(config)),
@@ -3688,6 +3786,11 @@ def _training_recovery_identity(
             prepared.compatibility_artifact_id if prepared is not None else None
         ),
         "source_git_commit": source_commit,
+        "prepared_source_git_commit": (
+            prepared.source_git_commit
+            if isinstance(prepared, BackedPreparedDataset)
+            else None
+        ),
         "ordered_gene_ids": ordered_gene_ids,
         "model_spec": _model_spec(genes[0], config["model"]),
         "readout_kind": "path_context",
@@ -3790,7 +3893,16 @@ def _restore_fit_checkpoint(
     max_epochs: int,
     patience: int,
     monitor_enabled: bool,
+    selection_metric: str = "validation_compatible_path_nll",
 ) -> dict[str, object]:
+    stored_metric = checkpoint.get(
+        "checkpoint_selection_metric", "validation_compatible_path_nll"
+    )
+    if stored_metric != selection_metric:
+        raise ValueError(
+            "resume checkpoint selection metric differs from the run objective: "
+            f"stored={stored_metric!r} expected={selection_metric!r}"
+        )
     completed_epoch = checkpoint["completed_epoch"]
     best_epoch = checkpoint["best_epoch"]
     epochs_without_improvement = checkpoint["epochs_without_improvement"]
@@ -3822,10 +3934,13 @@ def _restore_fit_checkpoint(
     ]
     if not np.isfinite(validation_nlls).all():
         raise ValueError("resume history contains non-finite validation NLL")
+    selection_values = [float(row[selection_metric]) for row in history]
+    if not np.isfinite(selection_values).all():
+        raise ValueError("resume history contains non-finite selection values")
     observed_best_nll = float(checkpoint["best_validation_nll"])
     if (
-        best_epoch != int(np.argmin(validation_nlls)) + 1
-        or observed_best_nll != validation_nlls[best_epoch - 1]
+        best_epoch != int(np.argmin(selection_values)) + 1
+        or observed_best_nll != selection_values[best_epoch - 1]
     ):
         raise ValueError("resume best checkpoint differs from validation history")
 
@@ -3931,6 +4046,9 @@ def _best_checkpoint_from_recovery(
         "condition": manifest["condition"],
         "completed_epoch": checkpoint["best_epoch"],
         "best_validation_nll": checkpoint["best_validation_nll"],
+        "checkpoint_selection_metric": checkpoint.get(
+            "checkpoint_selection_metric", "validation_compatible_path_nll"
+        ),
         "best_ont_matrix_kl_count_weighted": checkpoint[
             "best_ont_matrix_kl_count_weighted"
         ],
@@ -4066,6 +4184,11 @@ def _write_run(
         "condition": run.manifest.condition,
         "completed_epoch": run.result.best_epoch,
         "best_validation_nll": run.result.best_validation_nll,
+        "checkpoint_selection_metric": (
+            "validation_compatible_path_nll_gene_macro"
+            if run.manifest.gene_objective == "gene_macro"
+            else "validation_compatible_path_nll"
+        ),
         "best_ont_matrix_kl_count_weighted": (
             run.result.best_ont_matrix_kl_count_weighted
         ),

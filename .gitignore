@@ -14,6 +14,7 @@ dist/
 /outputs/
 /tmp/
 /data/processed/
+/data/data_cpu/
 
-# Local reference material
-/paper/*.pdf
+# Local reference material (external PDFs / manuscripts, not project outputs)
+/paper/
