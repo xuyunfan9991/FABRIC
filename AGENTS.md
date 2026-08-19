@@ -1,62 +1,61 @@
-# FABRIC — Repository Layout & Artifact Contract
+# FABRIC — 仓库布局与产物读写约定
 
-FABRIC (Factor-Aware Branch Regulation of Isoform Choice) is a gene-level graph
-model of isoform choice from single-cell long-read (ONT) + Illumina RNA + ATAC
-data. The authoritative design contract is
-[docs/FABRIC_ARCHITECTURE_V2.md](docs/FABRIC_ARCHITECTURE_V2.md) (V1 is
-historical). Research history (proposal, experiment plan, tracker, external
-reviews) lives in [refine-logs/](refine-logs/).
+FABRIC（Factor-Aware Branch Regulation of Isoform Choice）是一个基因级图模型，
+从单细胞长读长（ONT）+ Illumina RNA + ATAC 数据建模 isoform 选择。
+权威设计契约见 [docs/FABRIC_ARCHITECTURE_V2.md](docs/FABRIC_ARCHITECTURE_V2.md)
+（V1 仅作历史参考）。研究过程记录（提案、实验计划、tracker、外部评审）
+在 [refine-logs/](refine-logs/)。
 
-This file defines **where things live and where agents may read and write**.
-Any agent (Claude Code, Codex, …) working in this repo must follow it.
+本文件定义**各类东西放在哪、agent 可以在哪读写**。
+任何在本仓库工作的 agent（Claude Code、Codex 等）都必须遵守。
 
-## Directory map
+## 目录地图
 
-| Path | Git | What it is | Agent rules |
+| 路径 | Git | 是什么 | Agent 规则 |
 |---|---|---|---|
-| `src/fabric/` | tracked | The package. Entrypoints: `train.py`, `evaluate.py`. `*_real*` modules are the real-data path; `dataset.py`/`graph.py` etc. serve both toy and real. | Normal code changes. Files are large (3–4k lines); prefer surgical edits. |
-| `tests/` | tracked | Pytest suite. `tests/fixtures/real/` holds small committed parquet fixtures. | Add tests next to the module naming pattern `test_<module>.py`. |
-| `configs/` | tracked | YAML run configs. Each file is a **record of an authorized run setup** (carries `training_authorized` / `final_test_authorized` flags). | New run ⇒ new file. Never mutate a config that a finished run used. |
-| `docs/` | tracked | Architecture contracts. | V2 doc is authoritative; update it only for real design changes. |
-| `scripts/` | tracked | Post-hoc analysis, plotting, and ops scripts (top-1 eval, DTU recompute, checkpoint snapshot daemon). | **Run from repo root** — relative paths assume CWD = repo root. New analysis code goes here (and gets committed), never in `tmp/`. Outputs go to `outputs/analysis/`. |
-| `refine-logs/` | tracked | FINAL_PROPOSAL.md, EXPERIMENT_PLAN.md, EXPERIMENT_TRACKER.md, review rounds. | Append/update tracker rows as experiments progress. |
-| `sources/` | tracked | Literature survey notes (markdown). | Add new survey notes here. |
-| `data/` | mixed | See breakdown below. | |
-| `runs/` | **ignored** | Training outputs, one dir per run: `fabric_v2_<variant>_seed<seed>/` plus a sibling `<name>.log`. `runs/checkpoint_snapshots/<run>/epoch_N.pt` preserves per-epoch weights (train.py overwrites `latest.pt` in place). | **Append-only.** Never delete, rename, or overwrite an existing run dir or snapshot. Only `train.py` (or the snapshot daemon) writes here. |
-| `outputs/` | **ignored** | `validation/` = readiness/authorization logs; `analysis/` = derived analysis products (per-gene TSVs, top-1 JSONLs, figures PNGs) written by `scripts/`. | Regenerable but GPU-expensive — do not casually delete. Analysis scripts write here, nothing else does. |
-| `tmp/` | **ignored** | True scratch. Deletable at any time without loss. | Anything you'd mind losing does **not** belong here. |
-| `paper/` | **ignored** | External reference PDFs / collaborator manuscripts (inputs, not products). | Read-only reference material. |
+| `src/fabric/` | tracked | 主 package。入口：`train.py`、`evaluate.py`。`*_real*` 模块是真实数据路径；`dataset.py`/`graph.py` 等 toy 与 real 共用。 | 正常改代码。单文件很大（3–4k 行），优先做外科手术式小改动。 |
+| `tests/` | tracked | Pytest 测试套件。`tests/fixtures/real/` 存放已提交的小型 parquet fixture。 | 新测试按 `test_<module>.py` 的命名模式与模块对应。 |
+| `configs/` | tracked | YAML 运行配置。每个文件是**一次已授权运行设置的记录**（带 `training_authorized` / `final_test_authorized` 标志）。 | 新运行 ⇒ 新文件。已完成运行用过的 config 永不修改。 |
+| `docs/` | tracked | 架构契约文档。 | V2 文档是权威；只有真实设计变更才更新它。 |
+| `scripts/` | tracked | 事后分析、绘图与运维脚本（top-1 评估、DTU 重算、checkpoint 快照守护进程）。 | **必须从 repo 根目录运行**——相对路径默认 CWD 为 repo 根。新分析代码写在这里（并提交），绝不放 `tmp/`。产物写入 `outputs/analysis/`。 |
+| `refine-logs/` | tracked | FINAL_PROPOSAL.md、EXPERIMENT_PLAN.md、EXPERIMENT_TRACKER.md、评审轮次记录。 | 实验推进时追加/更新 tracker 行。 |
+| `sources/` | tracked | 文献调研笔记（markdown）。 | 新调研笔记放这里。 |
+| `data/` | 混合 | 见下方细分。 | |
+| `runs/` | **ignored** | 训练输出，每次运行一个目录：`fabric_v2_<variant>_seed<seed>/`，旁边是同名 `<name>.log`。`runs/checkpoint_snapshots/<run>/epoch_N.pt` 保存逐 epoch 权重（train.py 会原地覆盖 `latest.pt`）。 | **只增不删。**永不删除、重命名或覆盖已有的 run 目录或快照。只有 `train.py`（或快照守护进程）向这里写入。 |
+| `outputs/` | **ignored** | `validation/` = 就绪/授权验证日志；`analysis/` = `scripts/` 产出的衍生分析产物（per-gene TSV、top-1 JSONL、图 PNG）。 | 可再生但需消耗 GPU——不要随手删。只有分析脚本向这里写入。 |
+| `tmp/` | **ignored** | 真正的草稿区。随时可删，删了无损失。 | 任何丢了会心疼的东西都**不**属于这里。 |
+| `paper/` | **ignored** | 外部参考 PDF / 合作者手稿（输入材料，不是产物）。 | 只读参考材料。 |
 
-### `data/` breakdown
+### `data/` 细分
 
-| Path | Git | What it is |
+| 路径 | Git | 是什么 |
 |---|---|---|
-| `data/external_inputs.yaml` | tracked | **Single source of truth** for all external input paths (ONT matrix, Illumina RNA, ATAC peaks, GLUE embedding, reference FASTA/GTF — absolute paths into the PRISM / Multi_Omic projects). |
-| `data/DTU_score.R`, `data/DTU_result_sorted.xlsx` | tracked | Original DTU reference score + its R source (fidelity target for `scripts/recompute_dtu.py`). |
-| `data/processed/` | ignored | Versioned derived artifacts (e.g. `fabric_ont_gene_selection_v3`, `fabric_v2_compatible_ec_v1`), each with a manifest JSON. **Immutable once built** — a change means a new version id (`…_v2`), never editing in place. |
-| `data/data_cpu/` | ignored | ~13 GB local mirror of external matrices for CPU-side work. Has its own README. Read-only for agents. |
-| `data/gate_baselines/`, `data/splits/` | (empty) | Output targets created by code. |
+| `data/external_inputs.yaml` | tracked | 所有外部输入路径的**唯一事实源**（ONT 矩阵、Illumina RNA、ATAC peaks、GLUE embedding、参考 FASTA/GTF——指向 PRISM / Multi_Omic 项目的绝对路径）。 |
+| `data/DTU_score.R`、`data/DTU_result_sorted.xlsx` | tracked | 原始 DTU 参考分数及其 R 源码（`scripts/recompute_dtu.py` 的保真校验目标）。 |
+| `data/processed/` | ignored | 带版本号的衍生产物（如 `fabric_ont_gene_selection_v3`、`fabric_v2_compatible_ec_v1`），各自带 manifest JSON。**建成即不可变**——有变更就升新版本号（`…_v2`），绝不原地修改。 |
+| `data/data_cpu/` | ignored | 约 13 GB 的外部矩阵本地镜像，供 CPU 侧工作使用。自带 README。对 agent 只读。 |
+| `data/gate_baselines/`、`data/splits/` | （空） | 代码创建的输出落点。 |
 
-## Rules for reading and writing artifacts
+## 产物读写规则
 
-1. **Where to write what**
-   - New analysis / plotting script → `scripts/` (committed). Its data products → `outputs/analysis/`.
-   - New training run → new YAML in `configs/`, outputs land in `runs/<run_name>/` via `src/fabric/train.py`.
-   - Genuine throwaway scratch → `tmp/` (or the session scratchpad), nowhere else.
-   - Design decisions → `docs/`; experiment status → `refine-logs/EXPERIMENT_TRACKER.md`.
+1. **什么东西写到哪**
+   - 新分析/绘图脚本 → `scripts/`（提交）。其数据产物 → `outputs/analysis/`。
+   - 新训练运行 → `configs/` 里新建 YAML，输出经由 `src/fabric/train.py` 落到 `runs/<run_name>/`。
+   - 真正的一次性草稿 → `tmp/`（或会话 scratchpad），别的地方都不行。
+   - 设计决策 → `docs/`；实验状态 → `refine-logs/EXPERIMENT_TRACKER.md`。
 
-2. **Git hygiene**
-   - `runs/`, `outputs/`, `tmp/`, `paper/`, `data/processed/`, `data/data_cpu/` are gitignored **on purpose**. Never `git add -f` them; never blind `git add .` — check `git status` first.
-   - Commit scripts and configs alongside the results they produced, so every figure/table is regenerable from a tracked generator.
+2. **Git 卫生**
+   - `runs/`、`outputs/`、`tmp/`、`paper/`、`data/processed/`、`data/data_cpu/` 是**有意** gitignore 的。永不 `git add -f` 它们；永不盲目 `git add .`——先看 `git status`。
+   - 脚本和配置要与其产出的结果一起提交，保证每张图/每张表都能从已追踪的生成器再生。
 
-3. **External data is read-only.** Raw matrices live outside this repo (absolute paths in `data/external_inputs.yaml`). Never write into the PRISM or Multi_Omic project trees. When a script needs a raw input, take the path from `external_inputs.yaml` rather than hardcoding a new one.
+3. **外部数据只读。**原始矩阵在本仓库之外（绝对路径见 `data/external_inputs.yaml`）。永不向 PRISM 或 Multi_Omic 项目树写入。脚本需要原始输入时，从 `external_inputs.yaml` 取路径，不要另行硬编码。
 
-4. **Test-set discipline.** The architecture doc governs held-out test exposure. Configs carry explicit authorization flags; test-compatible rows are deliberately not materialized. **Never** compute, cache, or print test-set predictions/metrics unless a config with `final_test_authorized: true` exists and the user explicitly asks.
+4. **测试集纪律。**held-out test 的暴露由架构文档管辖。config 带显式授权标志；test-compatible 行是刻意不物化的。除非存在 `final_test_authorized: true` 的 config 且用户明确要求，**永不**计算、缓存或打印测试集预测/指标。
 
-5. **Run naming.** Training runs follow `fabric_v2_<variant>_seed<seed>` (e.g. `fabric_v2_atac_macro_seed1103`). Keep the pattern; the analysis scripts parse it.
+5. **运行命名。**训练运行遵循 `fabric_v2_<variant>_seed<seed>`（如 `fabric_v2_atac_macro_seed1103`）。保持该模式；分析脚本会解析它。
 
-## Running things
+## 如何运行
 
-- Environment: `pyproject.toml` (install with `pip install -e .`); tests via `pytest` from repo root (GPU smoke tests are in `tests/test_gpu_smoke.py`; most contract tests are CPU-only).
-- Training/eval: `python -m` or direct file execution of `src/fabric/train.py` / `evaluate.py` with a config from `configs/` (scripts insert `src/` into `sys.path` themselves).
-- Analysis: run `scripts/*.py` from repo root; they read `runs/` + `outputs/analysis/` and write back into `outputs/analysis/`.
+- 环境：`pyproject.toml`（`pip install -e .` 安装）；在 repo 根目录跑 `pytest`（GPU 冒烟测试在 `tests/test_gpu_smoke.py`；多数契约测试仅需 CPU）。
+- 训练/评估：用 `configs/` 里的配置直接执行 `src/fabric/train.py` / `evaluate.py`（脚本自行把 `src/` 插入 `sys.path`）。
+- 分析：从 repo 根目录运行 `scripts/*.py`；它们读取 `runs/` + `outputs/analysis/`，并写回 `outputs/analysis/`。
