@@ -354,7 +354,8 @@ def test_reliability_dtu_macro_fails_on_weight_contract_drift(tmp_path):
         candidate, seed=1103, condition="full"
     )
     assert candidate_manifest.gene_objective == "reliability_dtu_macro"
-    assert candidate["execution"]["training_authorized"] is False
+    assert candidate["execution"]["training_authorized"] is True
+    assert candidate_manifest.lr_scheduler_fixed_initial_epochs == 10
 
 
 def test_epoch_and_finalization_never_run_a_complete_train_evaluation(monkeypatch):
@@ -457,14 +458,15 @@ def test_gradient_clipping_precedes_each_gene_step_and_plateau_uses_validation_n
 ):
     gene = make_toy_genes()[0]
     config = load_config("configs/fabric_v2_toy.yaml")
-    config["training"]["max_epochs"] = 3
-    config["training"]["early_stopping_patience"] = 3
+    config["training"]["max_epochs"] = 4
+    config["training"]["early_stopping_patience"] = 4
     config["optimizer"]["learning_rate"] = 0.01
     config["optimizer"]["lr_scheduler"] = {
         "name": "reduce_on_plateau",
         "factor": 0.5,
         "patience": 0,
         "min_lr": 0.001,
+        "fixed_initial_epochs": 2,
     }
     config["optimizer"]["gradient_clip_norm"] = 1.0
     events = []
@@ -492,12 +494,16 @@ def test_gradient_clipping_precedes_each_gene_step_and_plateau_uses_validation_n
     )
     result = _train_full((gene,), config, seed=101, device="cpu")
     history = result.result.history
-    assert events == ["clip", "step"] * 3
-    assert history["epoch_learning_rate"].tolist() == pytest.approx([0.01, 0.01, 0.005])
+    assert events == ["clip", "step"] * 4
+    assert history["epoch_learning_rate"].tolist() == pytest.approx(
+        [0.01, 0.01, 0.01, 0.005]
+    )
     assert history["next_epoch_learning_rate"].tolist() == pytest.approx(
-        [0.01, 0.005, 0.0025]
+        [0.01, 0.01, 0.005, 0.0025]
     )
     assert set(history["lr_scheduler"]) == {"reduce_on_plateau"}
+    assert history["lr_scheduler_step_applied"].tolist() == [False, True, True, True]
+    assert set(history["lr_scheduler_fixed_initial_epochs"]) == {2}
     assert set(history["gradient_clip_norm"]) == {1.0}
     assert result.result.lr_scheduler_state_dict is not None
 

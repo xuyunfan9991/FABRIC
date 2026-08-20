@@ -295,6 +295,7 @@ class TrainingRunManifest:
     gene_weight_reliability_tau: float | None = None
     gene_weight_dtu_alpha: float | None = None
     gene_weight_table: str | None = None
+    lr_scheduler_fixed_initial_epochs: int = 0
 
     def validate(self) -> None:
         if type(self.seed) is not int:
@@ -346,6 +347,7 @@ class TrainingRunManifest:
             factor=self.lr_scheduler_factor,
             patience=self.lr_scheduler_patience,
             min_lr=self.lr_scheduler_min_lr,
+            fixed_initial_epochs=self.lr_scheduler_fixed_initial_epochs,
             learning_rate=float(self.learning_rate),
         )
         if (
@@ -1705,12 +1707,15 @@ def _validate_lr_scheduler_fields(
     factor: object,
     patience: object,
     min_lr: object,
+    fixed_initial_epochs: object,
     learning_rate: float,
 ) -> None:
     if name == "constant":
-        if any(value is not None for value in (factor, patience, min_lr)):
+        if any(value is not None for value in (factor, patience, min_lr)) or (
+            fixed_initial_epochs not in (None, 0)
+        ):
             raise ValueError(
-                "constant lr_scheduler cannot define factor, patience, or min_lr"
+                "constant lr_scheduler cannot define plateau controls"
             )
         return
     if name != "reduce_on_plateau":
@@ -1734,6 +1739,10 @@ def _validate_lr_scheduler_fields(
     ):
         raise ValueError(
             "reduce_on_plateau min_lr must be positive and no greater than learning_rate"
+        )
+    if type(fixed_initial_epochs) is not int or fixed_initial_epochs < 0:
+        raise ValueError(
+            "reduce_on_plateau fixed_initial_epochs must be a non-negative integer"
         )
 
 
@@ -1761,11 +1770,14 @@ def _validate_optimizer_config(optimizer: object) -> None:
         factor=scheduler.get("factor"),
         patience=scheduler.get("patience"),
         min_lr=scheduler.get("min_lr"),
+        fixed_initial_epochs=scheduler.get("fixed_initial_epochs", 0),
         learning_rate=learning_rate,
     )
     expected_scheduler_fields = (
         {"name"}
         if scheduler.get("name") == "constant"
+        else {"name", "factor", "patience", "min_lr", "fixed_initial_epochs"}
+        if "fixed_initial_epochs" in scheduler
         else {"name", "factor", "patience", "min_lr"}
     )
     if set(scheduler) != expected_scheduler_fields:
@@ -1844,6 +1856,7 @@ def resolve_run_config(
     lr_factor: float | None = None,
     lr_patience: int | None = None,
     min_lr: float | None = None,
+    lr_fixed_initial_epochs: int | None = None,
     gradient_clip_norm: float | None = None,
     lambda_base: float | None = None,
     lambda_int: float | None = None,
@@ -1879,7 +1892,13 @@ def resolve_run_config(
     current_scheduler = optimizer["lr_scheduler"]
     scheduler_name = lr_scheduler or current_scheduler["name"]
     scheduler_parameter_override = any(
-        value is not None for value in (lr_factor, lr_patience, min_lr)
+        value is not None
+        for value in (
+            lr_factor,
+            lr_patience,
+            min_lr,
+            lr_fixed_initial_epochs,
+        )
     )
     if scheduler_name == "constant":
         if scheduler_parameter_override:
@@ -1891,7 +1910,7 @@ def resolve_run_config(
         previous = (
             current_scheduler if current_scheduler["name"] == scheduler_name else {}
         )
-        optimizer["lr_scheduler"] = {
+        resolved_scheduler = {
             "name": scheduler_name,
             "factor": (
                 lr_factor if lr_factor is not None else previous.get("factor", 0.5)
@@ -1901,6 +1920,13 @@ def resolve_run_config(
             ),
             "min_lr": min_lr if min_lr is not None else previous.get("min_lr", 1.0e-5),
         }
+        if lr_fixed_initial_epochs is not None or "fixed_initial_epochs" in previous:
+            resolved_scheduler["fixed_initial_epochs"] = (
+                lr_fixed_initial_epochs
+                if lr_fixed_initial_epochs is not None
+                else previous.get("fixed_initial_epochs", 0)
+            )
+        optimizer["lr_scheduler"] = resolved_scheduler
     else:
         raise ValueError("lr_scheduler must be constant or reduce_on_plateau")
     if gradient_clip_norm is not None:
@@ -2153,6 +2179,11 @@ def training_manifest_from_config(
             float(scheduler["min_lr"])
             if scheduler["name"] == "reduce_on_plateau"
             else None
+        ),
+        lr_scheduler_fixed_initial_epochs=(
+            int(scheduler.get("fixed_initial_epochs", 0))
+            if scheduler["name"] == "reduce_on_plateau"
+            else 0
         ),
         gradient_clip_norm=float(optimizer["gradient_clip_norm"]),
         lambda_base=float(optimizer["lambda_base"]),
@@ -2914,6 +2945,9 @@ def _fit_condition(
         lambda_int=float(optimizer_config["lambda_int"]),
     )
     lr_scheduler = build_lr_scheduler(optimizer, optimizer_config["lr_scheduler"])
+    lr_scheduler_fixed_initial_epochs = int(
+        optimizer_config["lr_scheduler"].get("fixed_initial_epochs", 0)
+    )
     gradient_clip_norm = float(optimizer_config["gradient_clip_norm"])
     max_epochs = int(training["max_epochs"])
     patience = int(training.get("early_stopping_patience", max_epochs))
@@ -3185,7 +3219,10 @@ def _fit_condition(
                     fields=fields,
                 )
             )
-        if lr_scheduler is not None:
+        lr_scheduler_step_applied = (
+            lr_scheduler is not None and epoch >= lr_scheduler_fixed_initial_epochs
+        )
+        if lr_scheduler_step_applied:
             lr_scheduler.step(selection_value)
         next_epoch_learning_rate = _optimizer_learning_rate(optimizer)
         best_improved = selection_value < best_nll
@@ -3210,6 +3247,10 @@ def _fit_condition(
                 "epoch_learning_rate": epoch_learning_rate,
                 "next_epoch_learning_rate": next_epoch_learning_rate,
                 "lr_scheduler": optimizer_config["lr_scheduler"]["name"],
+                "lr_scheduler_fixed_initial_epochs": (
+                    lr_scheduler_fixed_initial_epochs
+                ),
+                "lr_scheduler_step_applied": lr_scheduler_step_applied,
                 "gradient_clip_norm": gradient_clip_norm,
                 "validation_compatible_path_nll": val_nll,
                 "validation_compatible_path_nll_gene_macro": val_gene_macro_nll,
@@ -4731,6 +4772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lr-factor", type=float)
     parser.add_argument("--lr-patience", type=int)
     parser.add_argument("--min-lr", type=float)
+    parser.add_argument("--lr-fixed-initial-epochs", type=int)
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--lambda-base", type=float)
     parser.add_argument("--lambda-int", type=float)
@@ -4748,6 +4790,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lr_factor=args.lr_factor,
         lr_patience=args.lr_patience,
         min_lr=args.min_lr,
+        lr_fixed_initial_epochs=args.lr_fixed_initial_epochs,
         gradient_clip_norm=args.gradient_clip_norm,
         lambda_base=args.lambda_base,
         lambda_int=args.lambda_int,
