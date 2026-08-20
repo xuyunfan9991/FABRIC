@@ -1163,13 +1163,13 @@ V2 主模型删除独立 `StateScorer`。细胞状态通过当前细胞实测或
 
 ## 14. High-DTU policy
 
-high-DTU 不是模型结构、预测头或新 loss。主分析保留完整 eligible gene cohort，并保留 low-DTU/stable genes 作为必要对照；不得只选择 high-DTU genes 形成唯一训练或测试 universe。high-DTU 信息只允许用于：
+high-DTU 不是模型结构或预测头。主分析保留完整 eligible gene cohort，并保留 low-DTU/stable genes 作为必要对照；不得只选择 high-DTU genes 形成唯一训练或测试 universe。high-DTU 信息只允许用于：
 
-1. 单独标记的 train-only、预先有界的 sampling/weighting sensitivity；
+1. 单独标记、预先有界的 sampling/weighting sensitivity；
 2. validation/test 的预声明分层评价；
 3. 分析 DNA/RNA 增益是否集中在真正 context-responsive genes。
 
-`data/DTU_score.R` 以预先存在的 190-cell-type PSI/表达矩阵为输入，在 PSI、表达和 transcript-to-gene metadata 的共同 transcript 轴上要求至少两条 transcripts、至少两个 expressed cell types，并以 dominant-transcript switching 的 transcript-wise JS divergence 计算 score。交付的 `data/DTU_result_sorted.xlsx` 与 matrix-matched GTF 的 28,002-gene transcript counts 完全一致；其中 `top_DTU_gene` 恰好等价于 `DTU_score >= 0.7`，但阈值赋值代码不在该 R 文件中，且输入聚合是否包含 held-out test cells 尚无 split provenance 记录。因此该 label 当前只能作为 external diagnostic stratum，不得进入训练采样、权重或 gene admission；primary training 使用下一节定义的未重加权全 cohort objective。未来任何 train-derived high-DTU 定义只能在 train split 内拟合，再冻结到 validation/test。
+`data/DTU_score.R` 以预先存在的 190-cell-type PSI/表达矩阵为输入，在 PSI、表达和 transcript-to-gene metadata 的共同 transcript 轴上要求至少两条 transcripts、至少两个 expressed cell types，并以 dominant-transcript switching 的 transcript-wise JS divergence 计算 score。交付的 `data/DTU_result_sorted.xlsx` 与 matrix-matched GTF 的 28,002-gene transcript counts 完全一致；其中 `top_DTU_gene` 恰好等价于 `DTU_score >= 0.7`，但阈值赋值代码不在该 R 文件中。本轮 B2 variant 3 不新增或使用 high-DTU 二级标签，也不改变 gene admission；它只把 `G_fit.tsv` 的连续 `DTU_score` 转成全 G_fit cohort percentile，进入下一节明确定义的 bounded sensitivity loss。该结果不能冒充未重加权 primary objective，正式 test claim 仍须单独报告这一 score 的 split-provenance 限制。
 
 ## 15. Training design
 
@@ -1222,13 +1222,25 @@ GPU packing 固定为 `gene_shape_adaptive_v1`，不再用单一 `cells × edge_
 }.
 \]
 
-因此 cap、逐 epoch resampling 与 randomized gene order 改变计算预算和随机梯度方差，gene-shape packing 只改变 gene 内 microbatch 数；它们均不改变目标 estimand。一个 epoch 恰好有 \(G\) 个 optimizer steps，而不是一个 epoch 一步，也不是每个 microbatch 一步。若 provenance 审计完成后运行 high-DTU oversampling 或额外 gene multiplier，它必须成为单独命名的 sensitivity objective，在上述 baseline inclusion probability 之外记录额外 sampling probability 或 multiplier，并始终在原始未重加权 test distribution 上报告 NLL 与 calibration；不得将其结果冒充上述 primary objective。
+因此 cap、逐 epoch resampling 与 randomized gene order 改变计算预算和随机梯度方差，gene-shape packing 只改变 gene 内 microbatch 数；它们均不改变目标 estimand。一个 epoch 恰好有 \(G\) 个 optimizer steps，而不是一个 epoch 一步，也不是每个 microbatch 一步。
+
+B2 variant 3 是单独命名的 `reliability_dtu_macro` sensitivity objective。它不改变 compatible-path likelihood，只改变 genes 间的聚合。令 \(M_g\) 为 gene \(g\) 的完整 train informative EC molecule mass，τ 固定为 100，\(q_g\in[0,1]\) 为 `G_fit.tsv` 中连续 `DTU_score` 在完整 G_fit cohort 内的 average-rank percentile，且 \(0\le\alpha\le1\)：
+
+\[
+\ell_g=\frac{\sum_{i,k}n_{ik}\left[-\log\sum_{p\in C_k}P_{ig}(p)\right]}{M_g},\qquad
+w_g=\frac{M_g}{M_g+100}(1+\alpha q_g),
+\]
+\[
+\mathcal L_{reliability\_dtu}=\frac{\sum_g w_g\ell_g}{\sum_g w_g}.
+\]
+
+由于 runtime 仍对每个 gene 恰好执行一次 optimizer step，第 \(g\) 个 step 在 gene 内 HT 校正和 \(M_g\) 归一化之外再乘 \(G w_g/\sum_h w_h\)，从而恢复上述 weighted-macro estimand 并保持平均 step multiplier 为 1。Full、ATAC 与 RBP 对比必须读取同一张 `G_fit.tsv`、使用相同的 τ、α 和 gene axis；validation checkpoint selection 使用同一组权重对 per-gene validation NLL 聚合。所有 genes 的 \(w_g>0\)，不得把该 objective 改写成 high-DTU-only gene selection；原始未重加权 validation/test NLL 与 calibration 仍需同时报告。
 
 ### 15.3 Split and claim scope
 
 当前 primary split 直接采用 `docs/FABRIC_CELL_GENE_SELECTION.md` 已冻结的规则：217,933 个 ONT cells 在 Emb01--Emb09 每个胚胎内部独立执行 deterministic cell-level 80/10/10，split seed 为 `20260725`。划分单位必须是 globally unique cell ID，使同一细胞的所有 genes、molecules、matrix counts 和 EC rows 进入同一 split。它只支持九个已观测胚胎内部的 transductive supervised cell generalization；embryo holdout、donor holdout 或其他跨个体 claim 必须在独立 split 上验证，不能由该 cell holdout 结果代替。
 
-split-neutral 对象仅包括冻结的 matrix transcript identity 及其 graph/structural paths、reference sequence、motif libraries、静态 event collapse/routing/cap、raw factor/context vocabularies、scientific context-pair universe、feature vocabulary和train-independent feature calibration；它们对所有 splits共用。train-only对象包括 CIS normalization、gate baselines/scales/admission/support、event `model_active`、raw interaction-cell support、supported-rectangle canonical basis、combined rank audit/final active-basis mask、raw contrast/comparator claim table、Path/Alternative IdentifiabilityIndex，以及任何获准的 high-DTU sampling/weighting sensitivity。validation NLL只用于 early stopping、优化/容量选择、预声明诊断参数选择和 explanation-manifest中允许的support筛选；不能重估前述train-only对象，§15.4 的 ONT fields 另受更严格的非选择边界约束。test model inference 与预冻结的评估/claim-admission 套件只运行一次，不产生任何模型、catalog、threshold、case或报告规则反馈。
+split-neutral 对象仅包括冻结的 matrix transcript identity 及其 graph/structural paths、reference sequence、motif libraries、静态 event collapse/routing/cap、raw factor/context vocabularies、scientific context-pair universe、feature vocabulary和train-independent feature calibration；它们对所有 splits共用。train-only对象包括 CIS normalization、gate baselines/scales/admission/support、event `model_active`、raw interaction-cell support、supported-rectangle canonical basis、combined rank audit/final active-basis mask、raw contrast/comparator claim table和Path/Alternative IdentifiabilityIndex。validation NLL只用于 early stopping、优化/容量选择、预声明诊断参数选择和 explanation-manifest中允许的support筛选；不能重估前述train-only对象，§15.4 的 ONT fields 另受更严格的非选择边界约束。test model inference 与预冻结的评估/claim-admission 套件只运行一次，不产生任何模型、catalog、threshold、case或报告规则反馈。
 
 当前 10% test cell 的 ONT count columns 已被 ONT-first gene-selection workflow 随完整 matrix 一起物化，并已发布 full-matrix aggregate count；gene admission 本身只使用 train columns，但该 test 不能再称为 `unopened` 或 fully blinded。它仍是固定、未参与模型拟合和 admission 的 held-out evaluation split，正式 checkpoint 后可以按预冻结规则一次性评价；任何结果只能明确称为 `previously_materialized held-out test`。若要支持真正 blind confirmatory test claim，必须使用此前未读取的新独立 cohort 或预先封存的数据，不能靠重新命名当前 split 恢复盲态。
 
@@ -1275,7 +1287,7 @@ D_{KL}(q_{i,g}\Vert p_{i,g})
 
 稀有 factor×context 列不能依靠无收缩的最大似然估计。每条命令使用 AdamW 参数分组：bias 与 normalization 参数不做 weight decay；其他 base/backbone/readout weight matrices 使用一个共享的非负 \(\lambda_{base}\)；\(W_D^{int}\) 与 \(W_R^{int}\) 使用同一个更强且严格为正的 \(\lambda_{int}\)，并要求 \(\lambda_{int}>\lambda_{base}\ge0\)。这把显式 factor-specific positional deviation 向 `factor baseline + shared route-context baseline` 收缩，而不是把低支持 factor 合并为 `OTHER`；它不声称消除后续非线性网络可能形成的所有隐式 interaction。DNA/RNA 不分别设置 \(\lambda_{int}\)，不同 factors、genes 或 context bins 也不得拥有各自 penalty。
 
-learning rate、scheduler 与 global gradient-clipping norm 是每条命令的显式运行参数，而不是代码常量。当前 runtime 只实现窄而明确的 `constant` 与 `reduce_on_plateau` 两种 scheduler；后者在每个 completed epoch 的唯一完整 validation traversal 之后恰好调用一次，只读取 `validation_compatible_path_nll`，不得读取 `ont_matrix_kl_count_weighted` 或 test。每个 gene 的全部 adaptive microbatches 必须先完成 backward accumulation，再对全模型梯度执行至多一次预声明 global-norm clipping，随后恰好一次 `optimizer.step()`；不能按 microbatch clipping 或 step。history 必须同时记录本 epoch 实际 learning rate 与 scheduler 更新后的下一 epoch learning rate。checkpoint 必须保存选中 epoch 的 model、optimizer 和（若启用）scheduler state，避免状态身份丢失。
+learning rate、scheduler 与 global gradient-clipping norm 是每条命令的显式运行参数，而不是代码常量。当前 runtime 只实现窄而明确的 `constant` 与 `reduce_on_plateau` 两种 scheduler；后者可声明 `fixed_initial_epochs`，在该固定阶段内不更新 scheduler，并从固定阶段最后一个 completed epoch 的唯一完整 validation traversal 后开始每 epoch 恰好调用一次。scheduler 只读取与当前 gene objective 匹配的 validation NLL，不得读取 `ont_matrix_kl_count_weighted` 或 test。每个 gene 的全部 adaptive microbatches 必须先完成 backward accumulation，再对全模型梯度执行至多一次预声明 global-norm clipping，随后恰好一次 `optimizer.step()`；不能按 microbatch clipping 或 step。history 必须同时记录本 epoch 实际 learning rate、scheduler 是否更新以及更新后的下一 epoch learning rate。checkpoint 必须保存选中 epoch 的 model、optimizer 和（若启用）scheduler state，避免状态身份丢失。当前 B2 variant 3 的 Full/ATAC 配对运行均以 `5e-5` 完成 epoch 1–10，随后才允许 plateau scheduler 改变后续 epoch 的 learning rate。
 
 本次待启动 `full` 命令的配置默认值为 `learning_rate=5e-5`、`reduce_on_plateau(factor=0.5, patience=1, min_lr=1e-5)` 与 `gradient_clip_norm=1.0`。这些值是启动前预声明的单次运行策略，不是 tuning 结果；CLI 可逐命令覆盖并把 resolved values 冻结进 `TrainingRunManifest`、resolved config、optimizer manifest、checkpoint 与 epoch history。参数化不授权自动 grid、multi-seed expansion 或 test-based selection。
 
@@ -1489,7 +1501,7 @@ V2 实现至少需要以下高信息量测试：
 30. physical-event collapse 与 event 内 route-weight normalization 不复制 event mass；cap 明确按 `(anchor group, cap_evidence_class)` 而不是按整个 anchor 或 token 执行，DNA 两类 bucket 均饱和时该 anchor 可有 32 个 retained events；`RouteDegreeCapAudit` 精确复现 cap loss、renorm gain、anchor-mass decomposition、single/multi-anchor transitions 与 `external_only_coupling`；相同 token 上 1、4、16 个同 gate、同方向 events 的 synthetic fixture 中，hidden width 为 \(H\) 的固定无 affine pre-LayerNorm 必须满足 \(\lVert\widehat y_{i,e}\rVert_2\le\sqrt H\)，且 attention 输出、模型输出和梯度有限；test-local reference calculation 删除 pre-normalization 后应复现显著的 pre-attention norm 与 attention-score 放大，但不得为此在生产模型增加可切换分支，也不强制特定的精确 \(N\) 次幂；相同 event 数但 shared/different gate keys 得到预期不同的 \(B^{gate}\)，catalog burden 与仅含 `model_active` routes 的 model-input burden 不混淆，全部 audit fields 与分层报告可复现；
 31. `RNAWindowCoverageAudit` 的 eligible reference denominator provenance、基于全部 legal transcripts 的区域分类优先级、window membership、legal-route、cap-retained 与 train-derived model-active waterfall 可复现；前四步与 active suffix 的 split 语义不混淆，外部实验位点覆盖与 motif-candidate coverage 不混名；
 32. `RETAINED_INTRON` evidence fixture 区分双 boundary、单 boundary、intron-only、excising junction、multi-intron unspliced、`IR_evidence_censored`、processed-context support、internal priming 与 genomic-DNA flags；不充分 IR evidence 删除后只用剩余合格证据重建 \(C_k\)，无剩余区分证据时得到 \(C_k=\mathcal Y_g\)；降解/截短造成 compatible-set 变宽而不自动产生 IR-positive evidence，`IR_biogenesis_context` 与 `PathIdentifiabilityIndex` 正交，library/donor QC 汇总可复现；
-33. `TrainingRunManifest` 恰好包含一个命令 seed 和一个 `full|atac|rbp` condition，并冻结 resolved learning rate、scheduler 及参数、gradient clip norm、penalties、max epochs、early-stopping patience、per-gene cap、`optimizer_step_unit=train_positive_gene`、gene-microbatch accumulation、adaptive GPU target、kernel cell cap 与 backed-shard prefetch identity；拒绝 embedded seed lists、condition lists、独立 `sampling_seed` 与内部 condition 名；相同 seed/condition/config/input 重建相同初始化、逐 epoch gene-cell 抽样和 gene update order，重复 seed 或 condition 由用户分别提交命令；
+33. `TrainingRunManifest` 恰好包含一个命令 seed 和一个 `full|atac|rbp` condition，并冻结 resolved learning rate、scheduler、`fixed_initial_epochs` 及其他 scheduler 参数、gradient clip norm、penalties、max epochs、early-stopping patience、per-gene cap、`optimizer_step_unit=train_positive_gene`、gene-microbatch accumulation、adaptive GPU target、kernel cell cap 与 backed-shard prefetch identity；拒绝 embedded seed lists、condition lists、独立 `sampling_seed` 与内部 condition 名；相同 seed/condition/config/input 重建相同初始化、逐 epoch gene-cell 抽样和 gene update order，重复 seed 或 condition 由用户分别提交命令；
 - completed-epoch recovery fixture 在相同 seed/condition/resolved config/input 上验证 uninterrupted 与 interrupt-after-atomic-`latest.pt` 后 `--resume-from` 的逐 epoch history、monitor、best epoch/NLL、最终 model、optimizer、scheduler 与 RNG continuation 完全一致；篡改 seed、condition、config、有序 gene identity、checkpoint epoch/history/early-stopping state 或改用 `best.pt` 必须明确失败，同一 run-dir 的并发 writer 必须被拒绝；恢复不产生额外 validation traversal，不读取 test，也不重复已完成 epoch；
 34. `LongReadCompatibilityAudit` 仅以 model-admitted、具有非空冻结 \(\mathcal Y_g\)、pre-compatibility technical-QC-pass 且正 molecule mass 的 rows 为统计总体；将其互斥完备地分成 \(C_k=\varnothing\)、\(\varnothing\ne C_k\subsetneq\mathcal Y_g\) 与 \(C_k=\mathcal Y_g\)，逐 stratum 验证三类 mass 之和等于总体 mass，并复现分开的 count/mass/fraction；零分母标为 `not_estimable`，technical failure 与 `no_matrix_isoform_compatible` reason codes 不混淆，后者不进入 likelihood 也不被自动标成 novel isoform；
 35. 相同 focal internal swap 被嵌入递增 \(D_g^{path}\)/\(V_g\) 的合成 catalogs 时，未缩放 residual sum 仍保持共同 constitutive padding invariance 与局部差分等式，并可复现 `PathScaleAudit` 的 \(\zeta\)、preactivation、logit、gradient 和 calibration strata；unit-test-only 候选 \(1/\sqrt{\max(1,D_g^{path})}\) reference calculation 只验证等比例 pair difference 与共同 padding invariance，不成为 production runtime 开关；
