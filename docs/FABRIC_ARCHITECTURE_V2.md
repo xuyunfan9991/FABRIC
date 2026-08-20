@@ -1163,13 +1163,13 @@ V2 主模型删除独立 `StateScorer`。细胞状态通过当前细胞实测或
 
 ## 14. High-DTU policy
 
-high-DTU 不是模型结构、预测头或新 loss。主分析保留完整 eligible gene cohort，并保留 low-DTU/stable genes 作为必要对照；不得只选择 high-DTU genes 形成唯一训练或测试 universe。high-DTU 信息只允许用于：
+high-DTU 不是模型结构或预测头。主分析保留完整 eligible gene cohort，并保留 low-DTU/stable genes 作为必要对照；不得只选择 high-DTU genes 形成唯一训练或测试 universe。high-DTU 信息只允许用于：
 
-1. 单独标记的 train-only、预先有界的 sampling/weighting sensitivity；
+1. 单独标记、预先有界的 sampling/weighting sensitivity；
 2. validation/test 的预声明分层评价；
 3. 分析 DNA/RNA 增益是否集中在真正 context-responsive genes。
 
-`data/DTU_score.R` 以预先存在的 190-cell-type PSI/表达矩阵为输入，在 PSI、表达和 transcript-to-gene metadata 的共同 transcript 轴上要求至少两条 transcripts、至少两个 expressed cell types，并以 dominant-transcript switching 的 transcript-wise JS divergence 计算 score。交付的 `data/DTU_result_sorted.xlsx` 与 matrix-matched GTF 的 28,002-gene transcript counts 完全一致；其中 `top_DTU_gene` 恰好等价于 `DTU_score >= 0.7`，但阈值赋值代码不在该 R 文件中，且输入聚合是否包含 held-out test cells 尚无 split provenance 记录。因此该 label 当前只能作为 external diagnostic stratum，不得进入训练采样、权重或 gene admission；primary training 使用下一节定义的未重加权全 cohort objective。未来任何 train-derived high-DTU 定义只能在 train split 内拟合，再冻结到 validation/test。
+`data/DTU_score.R` 以预先存在的 190-cell-type PSI/表达矩阵为输入，在 PSI、表达和 transcript-to-gene metadata 的共同 transcript 轴上要求至少两条 transcripts、至少两个 expressed cell types，并以 dominant-transcript switching 的 transcript-wise JS divergence 计算 score。交付的 `data/DTU_result_sorted.xlsx` 与 matrix-matched GTF 的 28,002-gene transcript counts 完全一致；其中 `top_DTU_gene` 恰好等价于 `DTU_score >= 0.7`，但阈值赋值代码不在该 R 文件中。本轮 B2 variant 3 不新增或使用 high-DTU 二级标签，也不改变 gene admission；它只把 `G_fit.tsv` 的连续 `DTU_score` 转成全 G_fit cohort percentile，进入下一节明确定义的 bounded sensitivity loss。该结果不能冒充未重加权 primary objective，正式 test claim 仍须单独报告这一 score 的 split-provenance 限制。
 
 ## 15. Training design
 
@@ -1222,13 +1222,25 @@ GPU packing 固定为 `gene_shape_adaptive_v1`，不再用单一 `cells × edge_
 }.
 \]
 
-因此 cap、逐 epoch resampling 与 randomized gene order 改变计算预算和随机梯度方差，gene-shape packing 只改变 gene 内 microbatch 数；它们均不改变目标 estimand。一个 epoch 恰好有 \(G\) 个 optimizer steps，而不是一个 epoch 一步，也不是每个 microbatch 一步。若 provenance 审计完成后运行 high-DTU oversampling 或额外 gene multiplier，它必须成为单独命名的 sensitivity objective，在上述 baseline inclusion probability 之外记录额外 sampling probability 或 multiplier，并始终在原始未重加权 test distribution 上报告 NLL 与 calibration；不得将其结果冒充上述 primary objective。
+因此 cap、逐 epoch resampling 与 randomized gene order 改变计算预算和随机梯度方差，gene-shape packing 只改变 gene 内 microbatch 数；它们均不改变目标 estimand。一个 epoch 恰好有 \(G\) 个 optimizer steps，而不是一个 epoch 一步，也不是每个 microbatch 一步。
+
+B2 variant 3 是单独命名的 `reliability_dtu_macro` sensitivity objective。它不改变 compatible-path likelihood，只改变 genes 间的聚合。令 \(M_g\) 为 gene \(g\) 的完整 train informative EC molecule mass，τ 固定为 100，\(q_g\in[0,1]\) 为 `G_fit.tsv` 中连续 `DTU_score` 在完整 G_fit cohort 内的 average-rank percentile，且 \(0\le\alpha\le1\)：
+
+\[
+\ell_g=\frac{\sum_{i,k}n_{ik}\left[-\log\sum_{p\in C_k}P_{ig}(p)\right]}{M_g},\qquad
+w_g=\frac{M_g}{M_g+100}(1+\alpha q_g),
+\]
+\[
+\mathcal L_{reliability\_dtu}=\frac{\sum_g w_g\ell_g}{\sum_g w_g}.
+\]
+
+由于 runtime 仍对每个 gene 恰好执行一次 optimizer step，第 \(g\) 个 step 在 gene 内 HT 校正和 \(M_g\) 归一化之外再乘 \(G w_g/\sum_h w_h\)，从而恢复上述 weighted-macro estimand 并保持平均 step multiplier 为 1。Full、ATAC 与 RBP 对比必须读取同一张 `G_fit.tsv`、使用相同的 τ、α 和 gene axis；validation checkpoint selection 使用同一组权重对 per-gene validation NLL 聚合。所有 genes 的 \(w_g>0\)，不得把该 objective 改写成 high-DTU-only gene selection；原始未重加权 validation/test NLL 与 calibration 仍需同时报告。
 
 ### 15.3 Split and claim scope
 
 当前 primary split 直接采用 `docs/FABRIC_CELL_GENE_SELECTION.md` 已冻结的规则：217,933 个 ONT cells 在 Emb01--Emb09 每个胚胎内部独立执行 deterministic cell-level 80/10/10，split seed 为 `20260725`。划分单位必须是 globally unique cell ID，使同一细胞的所有 genes、molecules、matrix counts 和 EC rows 进入同一 split。它只支持九个已观测胚胎内部的 transductive supervised cell generalization；embryo holdout、donor holdout 或其他跨个体 claim 必须在独立 split 上验证，不能由该 cell holdout 结果代替。
 
-split-neutral 对象仅包括冻结的 matrix transcript identity 及其 graph/structural paths、reference sequence、motif libraries、静态 event collapse/routing/cap、raw factor/context vocabularies、scientific context-pair universe、feature vocabulary和train-independent feature calibration；它们对所有 splits共用。train-only对象包括 CIS normalization、gate baselines/scales/admission/support、event `model_active`、raw interaction-cell support、supported-rectangle canonical basis、combined rank audit/final active-basis mask、raw contrast/comparator claim table、Path/Alternative IdentifiabilityIndex，以及任何获准的 high-DTU sampling/weighting sensitivity。validation NLL只用于 early stopping、优化/容量选择、预声明诊断参数选择和 explanation-manifest中允许的support筛选；不能重估前述train-only对象，§15.4 的 ONT fields 另受更严格的非选择边界约束。test model inference 与预冻结的评估/claim-admission 套件只运行一次，不产生任何模型、catalog、threshold、case或报告规则反馈。
+split-neutral 对象仅包括冻结的 matrix transcript identity 及其 graph/structural paths、reference sequence、motif libraries、静态 event collapse/routing/cap、raw factor/context vocabularies、scientific context-pair universe、feature vocabulary和train-independent feature calibration；它们对所有 splits共用。train-only对象包括 CIS normalization、gate baselines/scales/admission/support、event `model_active`、raw interaction-cell support、supported-rectangle canonical basis、combined rank audit/final active-basis mask、raw contrast/comparator claim table和Path/Alternative IdentifiabilityIndex。validation NLL只用于 early stopping、优化/容量选择、预声明诊断参数选择和 explanation-manifest中允许的support筛选；不能重估前述train-only对象，§15.4 的 ONT fields 另受更严格的非选择边界约束。test model inference 与预冻结的评估/claim-admission 套件只运行一次，不产生任何模型、catalog、threshold、case或报告规则反馈。
 
 当前 10% test cell 的 ONT count columns 已被 ONT-first gene-selection workflow 随完整 matrix 一起物化，并已发布 full-matrix aggregate count；gene admission 本身只使用 train columns，但该 test 不能再称为 `unopened` 或 fully blinded。它仍是固定、未参与模型拟合和 admission 的 held-out evaluation split，正式 checkpoint 后可以按预冻结规则一次性评价；任何结果只能明确称为 `previously_materialized held-out test`。若要支持真正 blind confirmatory test claim，必须使用此前未读取的新独立 cohort 或预先封存的数据，不能靠重新命名当前 split 恢复盲态。
 

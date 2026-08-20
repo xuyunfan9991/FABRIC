@@ -50,6 +50,29 @@ def _one_epoch_config():
     return config
 
 
+def _reliability_dtu_config(config, genes, tmp_path, *, scores=None):
+    scores = list(scores if scores is not None else range(len(genes)))
+    table = pd.DataFrame(
+        {
+            "target_gene_id": [gene.gene_id for gene in genes],
+            "DTU_score": scores,
+            "train_positive_informative_ec_mass": [
+                int(split_informative_molecule_mass((gene,), "train"))
+                for gene in genes
+            ],
+        }
+    )
+    table_path = tmp_path / "G_fit.tsv"
+    table.to_csv(table_path, sep="\t", index=False)
+    config["training"]["gene_objective"] = "reliability_dtu_macro"
+    config["training"]["gene_weighting"] = {
+        "reliability_tau": 100.0,
+        "dtu_alpha": 1.0,
+        "dtu_score_table": str(table_path),
+    }
+    return table_path
+
+
 def _train_full(genes, config, *, seed, device, monitor_callback=None):
     return train_run(
         genes,
@@ -231,6 +254,107 @@ def test_epoch_uses_one_condition_and_the_global_train_denominator():
     assert set(result.metrics["condition"]) == {"full"}
     assert set(result.metrics["split"]) == {"val"}
     assert np.isfinite(result.metrics["validation_compatible_path_nll"]).all()
+
+
+def test_reliability_dtu_macro_uses_exact_gene_weights_and_matching_validation(
+    tmp_path,
+):
+    first = make_toy_genes()[0]
+    genes = (first, replace(first, gene_id="TOY_GENE_SECOND"))
+    config = _one_epoch_config()
+    _reliability_dtu_config(config, genes, tmp_path, scores=(0.0, 1.0))
+
+    weighting = train_module._load_gene_objective_weighting(
+        genes, config["training"]
+    )
+    assert weighting is not None
+    train_mass = split_informative_molecule_mass((first,), "train")
+    reliability = train_mass / (train_mass + 100.0)
+    assert weighting.dtu_percentile_by_gene == {
+        first.gene_id: 0.0,
+        "TOY_GENE_SECOND": 1.0,
+    }
+    assert weighting.weight_by_gene[first.gene_id] == pytest.approx(reliability)
+    assert weighting.weight_by_gene["TOY_GENE_SECOND"] == pytest.approx(
+        2.0 * reliability
+    )
+    assert weighting.step_multiplier(first.gene_id, 2) == pytest.approx(2.0 / 3.0)
+    assert weighting.step_multiplier("TOY_GENE_SECOND", 2) == pytest.approx(4.0 / 3.0)
+
+    run_dir = tmp_path / "weighted_run"
+    result = train_run(
+        genes,
+        config,
+        seed=101,
+        condition="full",
+        device="cpu",
+        run_dir=run_dir,
+    )
+    snapshot = evaluate_split(
+        genes,
+        result.result.model,
+        condition="full",
+        split="val",
+        model_config=config["model"],
+        resources=config["resources"],
+    )
+    expected_selection = weighting.validation_nll(snapshot)
+    history = result.result.history.iloc[0]
+    assert history[
+        "validation_compatible_path_nll_reliability_dtu_macro"
+    ] == pytest.approx(expected_selection)
+    assert history["checkpoint_selection_metric"] == (
+        "validation_compatible_path_nll_reliability_dtu_macro"
+    )
+    assert result.result.best_validation_nll == pytest.approx(expected_selection)
+    assert result.metrics.loc[
+        0, "validation_compatible_path_nll_reliability_dtu_macro"
+    ] == pytest.approx(expected_selection)
+    assert pd.isna(history["uniform_gene_step_objective_multiplier"])
+    assert history["gene_step_objective_multiplier_min"] == pytest.approx(2.0 / 3.0)
+    assert history["gene_step_objective_multiplier_max"] == pytest.approx(4.0 / 3.0)
+    assert result.manifest.gene_weight_reliability_tau == 100.0
+    assert result.manifest.gene_weight_dtu_alpha == 1.0
+    checkpoint = torch.load(
+        run_dir / "checkpoint.pt", map_location="cpu", weights_only=False
+    )
+    checkpoint_manifest = json.loads((run_dir / "checkpoint_manifest.json").read_text())
+    assert checkpoint["checkpoint_selection_metric"] == (
+        "validation_compatible_path_nll_reliability_dtu_macro"
+    )
+    assert checkpoint_manifest["selection_metric"] == (
+        "validation_compatible_path_nll_reliability_dtu_macro"
+    )
+    assert checkpoint_manifest["record"][
+        "best_validation_reliability_dtu_macro_compatible_path_nll"
+    ] == pytest.approx(expected_selection)
+
+
+def test_reliability_dtu_macro_fails_on_weight_contract_drift(tmp_path):
+    genes = tuple(make_toy_genes())
+    config = _one_epoch_config()
+    table_path = _reliability_dtu_config(config, genes, tmp_path)
+    table = pd.read_csv(table_path, sep="\t")
+    table.loc[0, "train_positive_informative_ec_mass"] += 1
+    table.to_csv(table_path, sep="\t", index=False)
+    with pytest.raises(ValueError, match="train mass differs"):
+        _train_full(genes, config, seed=101, device="cpu")
+
+    changed = copy.deepcopy(config)
+    changed["training"]["gene_weighting"]["reliability_tau"] = 99.0
+    config_path = tmp_path / "bad_tau.yaml"
+    config_path.write_text(yaml.safe_dump(changed, sort_keys=False))
+    with pytest.raises(ValueError, match="frozen at 100"):
+        load_config(config_path)
+
+    candidate = load_config(
+        "configs/fabric_v2_full_cohort_reliability_dtu_macro.yaml"
+    )
+    candidate_manifest = training_manifest_from_config(
+        candidate, seed=1103, condition="full"
+    )
+    assert candidate_manifest.gene_objective == "reliability_dtu_macro"
+    assert candidate["execution"]["training_authorized"] is False
 
 
 def test_epoch_and_finalization_never_run_a_complete_train_evaluation(monkeypatch):

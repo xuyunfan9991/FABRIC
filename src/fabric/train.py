@@ -45,12 +45,17 @@ if __name__ == "__main__":
 SPLITS = ("train", "val", "test")
 FULL_COHORT_SCOPE = "full_cohort"
 RUN_CONDITIONS = ("full", "atac", "rbp")
-# Between-gene weighting of the training objective.  molecule_weighted is the
-# original global molecule-mass average; gene_macro normalizes each gene step
-# by that gene's own full-train molecule mass so every gene carries equal
-# weight (B2 variant 2).  Within-gene weighting stays molecule-weighted in
-# both modes, and checkpoint selection follows the matching validation metric.
-GENE_OBJECTIVES = ("molecule_weighted", "gene_macro")
+# Between-gene weighting of the training objective.  Every mode keeps the same
+# molecule-counted compatible-path NLL within a gene.  ``molecule_weighted`` is
+# the original global molecule-mass average, ``gene_macro`` gives every gene
+# equal weight, and ``reliability_dtu_macro`` uses the predeclared B2 variant-3
+# reliability/DTU weights.  Checkpoint selection follows the matching
+# validation aggregation in every mode.
+GENE_OBJECTIVES = (
+    "molecule_weighted",
+    "gene_macro",
+    "reliability_dtu_macro",
+)
 _MODEL_CONDITION = {"full": "full", "atac": "cis_dna", "rbp": "cis_rna"}
 
 
@@ -287,6 +292,9 @@ class TrainingRunManifest:
     prefetch_backed_gene_shards: bool
     compute_precision: str
     gene_objective: str = "molecule_weighted"
+    gene_weight_reliability_tau: float | None = None
+    gene_weight_dtu_alpha: float | None = None
+    gene_weight_table: str | None = None
 
     def validate(self) -> None:
         if type(self.seed) is not int:
@@ -295,6 +303,35 @@ class TrainingRunManifest:
             raise ValueError(f"run condition must be one of {RUN_CONDITIONS}")
         if self.gene_objective not in GENE_OBJECTIVES:
             raise ValueError(f"gene_objective must be one of {GENE_OBJECTIVES}")
+        weighting_fields = (
+            self.gene_weight_reliability_tau,
+            self.gene_weight_dtu_alpha,
+            self.gene_weight_table,
+        )
+        if self.gene_objective == "reliability_dtu_macro":
+            if any(value is None for value in weighting_fields):
+                raise ValueError(
+                    "reliability_dtu_macro requires all gene-weight identities"
+                )
+            if float(self.gene_weight_reliability_tau) != 100.0:
+                raise ValueError("gene-weight reliability tau is frozen at 100")
+            alpha = self.gene_weight_dtu_alpha
+            if (
+                isinstance(alpha, bool)
+                or not isinstance(alpha, (int, float))
+                or not np.isfinite(alpha)
+                or not 0 <= alpha <= 1
+            ):
+                raise ValueError("gene-weight DTU alpha must lie in [0, 1]")
+            if (
+                not isinstance(self.gene_weight_table, str)
+                or not self.gene_weight_table.strip()
+            ):
+                raise ValueError("gene-weight table must be nonempty")
+        elif any(value is not None for value in weighting_fields):
+            raise ValueError(
+                "gene-weight fields are only valid for reliability_dtu_macro"
+            )
         if (
             isinstance(self.learning_rate, bool)
             or not isinstance(self.learning_rate, (int, float))
@@ -1338,6 +1375,163 @@ class ValidationSnapshot:
 
 
 @dataclass(frozen=True)
+class GeneObjectiveWeighting:
+    """Frozen gene weights for the B2 reliability/DTU sensitivity."""
+
+    train_mass_by_gene: Mapping[str, float]
+    dtu_percentile_by_gene: Mapping[str, float]
+    weight_by_gene: Mapping[str, float]
+    total_weight: float
+    reliability_tau: float
+    dtu_alpha: float
+    table_path: str
+
+    def step_multiplier(self, gene_id: str, gene_count: int) -> float:
+        """Restore the weighted macro estimand under uniform gene steps."""
+
+        return gene_count * self.weight_by_gene[gene_id] / self.total_weight
+
+    def validation_nll(self, snapshot: ValidationSnapshot) -> float:
+        """Aggregate validation gene means with the same training weights."""
+
+        if not snapshot.per_gene_nll:
+            raise ValueError(
+                "reliability_dtu_macro requires per-gene validation NLL"
+            )
+        seen: set[str] = set()
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for gene_id, nll_sum, molecule_mass in snapshot.per_gene_nll:
+            if gene_id in seen:
+                raise ValueError("validation NLL contains a duplicate gene")
+            seen.add(gene_id)
+            if gene_id not in self.weight_by_gene:
+                raise ValueError(
+                    f"validation gene {gene_id} is absent from the gene-weight table"
+                )
+            if not np.isfinite((nll_sum, molecule_mass)).all() or molecule_mass <= 0:
+                raise ValueError("validation per-gene NLL terms must be finite")
+            weight = self.weight_by_gene[gene_id]
+            weighted_sum += weight * nll_sum / molecule_mass
+            weight_sum += weight
+        if weight_sum <= 0:
+            raise ValueError("validation has zero reliability/DTU gene weight")
+        return weighted_sum / weight_sum
+
+
+def _checkpoint_selection_metric(gene_objective: str) -> str:
+    if gene_objective == "molecule_weighted":
+        return "validation_compatible_path_nll"
+    if gene_objective == "gene_macro":
+        return "validation_compatible_path_nll_gene_macro"
+    if gene_objective == "reliability_dtu_macro":
+        return "validation_compatible_path_nll_reliability_dtu_macro"
+    raise ValueError(f"unknown gene objective: {gene_objective}")
+
+
+def _load_gene_objective_weighting(
+    genes: Sequence[PreparedGene], training: Mapping[str, object]
+) -> GeneObjectiveWeighting | None:
+    """Load and validate the complete G_fit weight table before fitting."""
+
+    objective = str(training.get("gene_objective", "molecule_weighted"))
+    if objective != "reliability_dtu_macro":
+        return None
+    weighting = training["gene_weighting"]
+    table_path = Path(str(weighting["dtu_score_table"]))
+    if not table_path.is_file():
+        raise FileNotFoundError(f"DTU gene-weight table does not exist: {table_path}")
+    table = pd.read_csv(table_path, sep="\t", dtype={"target_gene_id": str})
+    required = {
+        "target_gene_id",
+        "train_positive_informative_ec_mass",
+        "DTU_score",
+    }
+    missing_columns = sorted(required - set(table))
+    if missing_columns:
+        raise ValueError(
+            f"DTU gene-weight table misses columns: {missing_columns}"
+        )
+    if (
+        table.empty
+        or table["target_gene_id"].isna().any()
+        or table["target_gene_id"].astype(str).str.strip().eq("").any()
+        or table["target_gene_id"].duplicated().any()
+    ):
+        raise ValueError("DTU gene-weight table requires unique nonempty gene IDs")
+    observed_gene_ids = tuple(table["target_gene_id"].astype(str))
+    expected_gene_ids = (
+        tuple(gene_id for gene_id, _ in genes.records)
+        if isinstance(genes, BackedGeneSequence)
+        else tuple(gene.gene_id for gene in genes)
+    )
+    if len(set(expected_gene_ids)) != len(expected_gene_ids):
+        raise ValueError("training gene axis contains duplicate gene IDs")
+    missing_genes = sorted(set(expected_gene_ids) - set(observed_gene_ids))
+    extra_genes = sorted(set(observed_gene_ids) - set(expected_gene_ids))
+    if missing_genes or extra_genes:
+        raise ValueError(
+            "DTU gene-weight table differs from the complete G_fit axis: "
+            f"missing={missing_genes[:5]} extra={extra_genes[:5]}"
+        )
+    masses = pd.to_numeric(
+        table["train_positive_informative_ec_mass"], errors="coerce"
+    ).to_numpy(dtype=np.float64)
+    dtu_scores = pd.to_numeric(table["DTU_score"], errors="coerce").to_numpy(
+        dtype=np.float64
+    )
+    if (
+        not np.isfinite(masses).all()
+        or bool((masses <= 0).any())
+        or not np.equal(masses, np.floor(masses)).all()
+    ):
+        raise ValueError(
+            "DTU gene-weight train molecule masses must be positive integers"
+        )
+    if not np.isfinite(dtu_scores).all() or bool((dtu_scores < 0).any()):
+        raise ValueError("DTU gene-weight scores must be finite and non-negative")
+
+    # Continuous cohort percentile with average ranks for tied scores.  The
+    # N=1 branch is only for tiny implementation fixtures; full G_fit has many
+    # genes and spans [0, 1] whenever scores are not all tied.
+    if len(dtu_scores) == 1:
+        percentiles = np.zeros(1, dtype=np.float64)
+    else:
+        percentiles = (
+            pd.Series(dtu_scores).rank(method="average").to_numpy() - 1.0
+        ) / (len(dtu_scores) - 1.0)
+
+    mass_by_gene = dict(zip(observed_gene_ids, masses.tolist(), strict=True))
+    percentile_by_gene = dict(
+        zip(observed_gene_ids, percentiles.tolist(), strict=True)
+    )
+    if not isinstance(genes, BackedGeneSequence):
+        for gene in genes:
+            observed_mass = split_informative_molecule_mass((gene,), "train")
+            if observed_mass != mass_by_gene[gene.gene_id]:
+                raise ValueError(
+                    f"DTU gene-weight train mass differs for gene {gene.gene_id}"
+                )
+
+    tau = float(weighting["reliability_tau"])
+    alpha = float(weighting["dtu_alpha"])
+    reliability = masses / (masses + tau)
+    weights = reliability * (1.0 + alpha * percentiles)
+    if not np.isfinite(weights).all() or bool((weights <= 0).any()):
+        raise ValueError("computed reliability/DTU gene weights must be positive")
+    weight_by_gene = dict(zip(observed_gene_ids, weights.tolist(), strict=True))
+    return GeneObjectiveWeighting(
+        train_mass_by_gene=mass_by_gene,
+        dtu_percentile_by_gene=percentile_by_gene,
+        weight_by_gene=weight_by_gene,
+        total_weight=float(weights.sum()),
+        reliability_tau=tau,
+        dtu_alpha=alpha,
+        table_path=str(table_path),
+    )
+
+
+@dataclass(frozen=True)
 class MonitorRecord:
     seed: int
     condition: str
@@ -1597,6 +1791,51 @@ def _validate_optimizer_config(optimizer: object) -> None:
     )
 
 
+def _validate_gene_objective_config(training: Mapping[str, object]) -> None:
+    objective = training.get("gene_objective", "molecule_weighted")
+    if objective not in GENE_OBJECTIVES:
+        raise ValueError(f"training.gene_objective must be one of {GENE_OBJECTIVES}")
+    weighting = training.get("gene_weighting")
+    if objective != "reliability_dtu_macro":
+        if weighting is not None:
+            raise ValueError(
+                "training.gene_weighting is only valid for reliability_dtu_macro"
+            )
+        return
+    if not isinstance(weighting, Mapping):
+        raise TypeError(
+            "reliability_dtu_macro requires training.gene_weighting"
+        )
+    expected_fields = {
+        "reliability_tau",
+        "dtu_alpha",
+        "dtu_score_table",
+    }
+    if set(weighting) != expected_fields:
+        raise ValueError(
+            "training.gene_weighting fields differ from the frozen contract"
+        )
+    tau = weighting["reliability_tau"]
+    if (
+        isinstance(tau, bool)
+        or not isinstance(tau, (int, float))
+        or not np.isfinite(tau)
+        or float(tau) != 100.0
+    ):
+        raise ValueError("training.gene_weighting.reliability_tau is frozen at 100")
+    alpha = weighting["dtu_alpha"]
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not np.isfinite(alpha)
+        or not 0 <= alpha <= 1
+    ):
+        raise ValueError("training.gene_weighting.dtu_alpha must lie in [0, 1]")
+    table = weighting["dtu_score_table"]
+    if not isinstance(table, str) or not table.strip():
+        raise ValueError("training.gene_weighting.dtu_score_table must be nonempty")
+
+
 def resolve_run_config(
     config: Mapping[str, object],
     *,
@@ -1801,6 +2040,7 @@ def load_config(path: str | Path) -> dict[str, object]:
         raise ValueError(
             "V2 must accumulate all attention microbatches before the gene step"
         )
+    _validate_gene_objective_config(training)
     model = config["model"]
     if not isinstance(model, dict):
         raise TypeError("model config must be a mapping")
@@ -1883,10 +2123,17 @@ def training_manifest_from_config(
     condition: str,
 ) -> TrainingRunManifest:
     training = config["training"]
+    _validate_gene_objective_config(training)
     optimizer = config["optimizer"]
     scheduler = optimizer["lr_scheduler"]
     resources = config.get("resources", {})
     inputs = config.get("inputs", {})
+    gene_objective = str(training.get("gene_objective", "molecule_weighted"))
+    gene_weighting = (
+        training["gene_weighting"]
+        if gene_objective == "reliability_dtu_macro"
+        else None
+    )
     manifest = TrainingRunManifest(
         seed=seed,
         condition=condition,
@@ -1932,7 +2179,22 @@ def training_manifest_from_config(
         max_cells_per_gpu_batch=int(resources["max_cells_per_gpu_batch"]),
         prefetch_backed_gene_shards=resources["prefetch_backed_gene_shards"],
         compute_precision=str(resources["compute_precision"]),
-        gene_objective=str(training.get("gene_objective", "molecule_weighted")),
+        gene_objective=gene_objective,
+        gene_weight_reliability_tau=(
+            float(gene_weighting["reliability_tau"])
+            if gene_weighting is not None
+            else None
+        ),
+        gene_weight_dtu_alpha=(
+            float(gene_weighting["dtu_alpha"])
+            if gene_weighting is not None
+            else None
+        ),
+        gene_weight_table=(
+            str(gene_weighting["dtu_score_table"])
+            if gene_weighting is not None
+            else None
+        ),
     )
     manifest.validate()
     return manifest
@@ -2418,6 +2680,7 @@ def train_run(
         raise RuntimeError("a disabled per-epoch monitor cannot receive a callback")
     if not isinstance(genes, BackedGeneSequence):
         _validate_genes(genes)
+    objective_weighting = _load_gene_objective_weighting(genes, config["training"])
     torch_device = torch.device(device)
     torch.set_float32_matmul_precision("highest")
     if torch_device.type == "cuda":
@@ -2497,6 +2760,7 @@ def train_run(
             seed=seed,
             config=config,
             monitor_callback=monitor_callback,
+            objective_weighting=objective_weighting,
             resume_checkpoint=resume_checkpoint,
             epoch_checkpoint_callback=checkpoint_callback,
             resume_validated_callback=(
@@ -2520,6 +2784,19 @@ def train_run(
                     float(best_history_row["validation_compatible_path_nll_gene_macro"])
                     if pd.notna(
                         best_history_row["validation_compatible_path_nll_gene_macro"]
+                    )
+                    else None
+                ),
+                "validation_compatible_path_nll_reliability_dtu_macro": (
+                    float(
+                        best_history_row[
+                            "validation_compatible_path_nll_reliability_dtu_macro"
+                        ]
+                    )
+                    if pd.notna(
+                        best_history_row[
+                            "validation_compatible_path_nll_reliability_dtu_macro"
+                        ]
                     )
                     else None
                 ),
@@ -2623,6 +2900,7 @@ def _fit_condition(
     seed: int,
     config: Mapping[str, object],
     monitor_callback: EpochMonitor | None,
+    objective_weighting: GeneObjectiveWeighting | None = None,
     resume_checkpoint: Mapping[str, object] | None = None,
     epoch_checkpoint_callback: EpochCheckpoint | None = None,
     resume_validated_callback: EpochCheckpoint | None = None,
@@ -2646,11 +2924,22 @@ def _fit_condition(
     gene_objective = str(training.get("gene_objective", "molecule_weighted"))
     if gene_objective not in GENE_OBJECTIVES:
         raise ValueError(f"training.gene_objective must be one of {GENE_OBJECTIVES}")
-    selection_metric_name = (
-        "validation_compatible_path_nll_gene_macro"
-        if gene_objective == "gene_macro"
-        else "validation_compatible_path_nll"
-    )
+    if objective_weighting is None:
+        objective_weighting = _load_gene_objective_weighting(genes, training)
+    if (gene_objective == "reliability_dtu_macro") != (
+        objective_weighting is not None
+    ):
+        raise ValueError("gene objective and frozen weighting state differ")
+    selection_metric_name = _checkpoint_selection_metric(gene_objective)
+    if objective_weighting is not None:
+        step_multipliers = tuple(
+            objective_weighting.step_multiplier(gene_id, train_positive_gene_count)
+            for gene_id in objective_weighting.weight_by_gene
+        )
+    elif gene_objective == "gene_macro":
+        step_multipliers = (1.0,)
+    else:
+        step_multipliers = (float(train_positive_gene_count),)
     # Full-train molecule mass per gene; constant across epochs, cached on
     # first touch so backed shards are not re-read for the normalizer.
     gene_train_mass_cache: dict[str, float] = {}
@@ -2779,7 +3068,7 @@ def _fit_condition(
                     row_cell_index=row_cell_index,
                     return_details=True,
                 )
-                if gene_objective == "gene_macro":
+                if gene_objective in {"gene_macro", "reliability_dtu_macro"}:
                     gene_train_mass = gene_train_mass_cache.get(gene.gene_id)
                     if gene_train_mass is None:
                         gene_train_mass = split_informative_molecule_mass(
@@ -2791,13 +3080,28 @@ def _fit_condition(
                                 "molecule mass"
                             )
                         gene_train_mass_cache[gene.gene_id] = gene_train_mass
-                    # Unbiased estimate of this gene's own mean NLL: the HT
-                    # inclusion multiplier restores the full-train weighted sum
-                    # and the gene's full-train mass normalizes it, so every
-                    # gene contributes one equally scaled step (B2 variant 2).
+                    gene_step_multiplier = 1.0
+                    if objective_weighting is not None:
+                        expected_mass = objective_weighting.train_mass_by_gene[
+                            gene.gene_id
+                        ]
+                        if gene_train_mass != expected_mass:
+                            raise ValueError(
+                                "DTU gene-weight train mass differs for gene "
+                                f"{gene.gene_id}"
+                            )
+                        # Uniform gene traversal has implicit probability 1/G;
+                        # G*w_g/sum(w) restores the frozen weighted macro
+                        # estimand without changing its mean step scale.
+                        gene_step_multiplier = objective_weighting.step_multiplier(
+                            gene.gene_id, train_positive_gene_count
+                        )
+                    # The HT multiplier restores the full gene numerator and
+                    # the gene's complete train mass gives its own mean NLL.
                     (
                         details.weighted_sum
                         * inclusion_multiplier
+                        * gene_step_multiplier
                         / gene_train_mass
                     ).backward()
                 else:
@@ -2845,12 +3149,23 @@ def _fit_condition(
             if validation_snapshot.per_gene_nll
             else None
         )
+        val_reliability_dtu_macro_nll = (
+            objective_weighting.validation_nll(validation_snapshot)
+            if objective_weighting is not None
+            else None
+        )
         if gene_objective == "gene_macro":
             if val_gene_macro_nll is None:
                 raise ValueError(
                     "gene_macro objective requires per-gene validation NLL"
                 )
             selection_value = val_gene_macro_nll
+        elif gene_objective == "reliability_dtu_macro":
+            if val_reliability_dtu_macro_nll is None:
+                raise ValueError(
+                    "reliability_dtu_macro requires per-gene validation NLL"
+                )
+            selection_value = val_reliability_dtu_macro_nll
         else:
             selection_value = val_nll
         ont_matrix_kl: float | None = None
@@ -2898,6 +3213,9 @@ def _fit_condition(
                 "gradient_clip_norm": gradient_clip_norm,
                 "validation_compatible_path_nll": val_nll,
                 "validation_compatible_path_nll_gene_macro": val_gene_macro_nll,
+                "validation_compatible_path_nll_reliability_dtu_macro": (
+                    val_reliability_dtu_macro_nll
+                ),
                 "gene_objective": gene_objective,
                 "checkpoint_selection_metric": selection_metric_name,
                 "ont_matrix_kl_count_weighted": ont_matrix_kl,
@@ -2919,7 +3237,28 @@ def _fit_condition(
                 "gene_microbatch_gradient_accumulation": training[
                     "gene_microbatch_gradient_accumulation"
                 ],
-                "uniform_gene_step_objective_multiplier": (train_positive_gene_count),
+                "uniform_gene_step_objective_multiplier": (
+                    step_multipliers[0]
+                    if len(set(step_multipliers)) == 1
+                    else None
+                ),
+                "gene_step_objective_multiplier_min": min(step_multipliers),
+                "gene_step_objective_multiplier_max": max(step_multipliers),
+                "gene_weight_reliability_tau": (
+                    objective_weighting.reliability_tau
+                    if objective_weighting is not None
+                    else None
+                ),
+                "gene_weight_dtu_alpha": (
+                    objective_weighting.dtu_alpha
+                    if objective_weighting is not None
+                    else None
+                ),
+                "gene_weight_total": (
+                    objective_weighting.total_weight
+                    if objective_weighting is not None
+                    else None
+                ),
             }
         )
 
@@ -4149,6 +4488,10 @@ def _write_run(
         raise AssertionError(
             "training artifact writer requires one validation metric row"
         )
+    selection_metric = _checkpoint_selection_metric(run.manifest.gene_objective)
+    best_history_row = run.result.history.loc[
+        run.result.history["epoch"].eq(run.result.best_epoch)
+    ].iloc[0]
     _atomic_write_text(
         run_dir / "config.yaml", yaml.safe_dump(dict(config), sort_keys=False)
     )
@@ -4215,11 +4558,7 @@ def _write_run(
         "condition": run.manifest.condition,
         "completed_epoch": run.result.best_epoch,
         "best_validation_nll": run.result.best_validation_nll,
-        "checkpoint_selection_metric": (
-            "validation_compatible_path_nll_gene_macro"
-            if run.manifest.gene_objective == "gene_macro"
-            else "validation_compatible_path_nll"
-        ),
+        "checkpoint_selection_metric": selection_metric,
         "best_ont_matrix_kl_count_weighted": (
             run.result.best_ont_matrix_kl_count_weighted
         ),
@@ -4270,7 +4609,7 @@ def _write_run(
             {
                 "contract": "FABRIC_ARCHITECTURE_V2",
                 "checkpoint_status": "FROZEN_AFTER_VALIDATION_SELECTION",
-                "selection_metric": "validation_molecule_weighted_compatible_path_nll",
+                "selection_metric": selection_metric,
                 "selection_rules_used_held_out_test": False,
                 "final_test_authorized_at_training_time": config["execution"][
                     "final_test_authorized"
@@ -4295,7 +4634,36 @@ def _write_run(
                         run.result.lr_scheduler_state_dict is not None
                     ),
                     "best_epoch": run.result.best_epoch,
-                    "best_validation_molecule_weighted_compatible_path_nll": run.result.best_validation_nll,
+                    "best_checkpoint_selection_value": run.result.best_validation_nll,
+                    "best_validation_molecule_weighted_compatible_path_nll": float(
+                        best_history_row["validation_compatible_path_nll"]
+                    ),
+                    "best_validation_gene_macro_compatible_path_nll": (
+                        float(
+                            best_history_row[
+                                "validation_compatible_path_nll_gene_macro"
+                            ]
+                        )
+                        if pd.notna(
+                            best_history_row[
+                                "validation_compatible_path_nll_gene_macro"
+                            ]
+                        )
+                        else None
+                    ),
+                    "best_validation_reliability_dtu_macro_compatible_path_nll": (
+                        float(
+                            best_history_row[
+                                "validation_compatible_path_nll_reliability_dtu_macro"
+                            ]
+                        )
+                        if pd.notna(
+                            best_history_row[
+                                "validation_compatible_path_nll_reliability_dtu_macro"
+                            ]
+                        )
+                        else None
+                    ),
                     "best_ont_matrix_kl_count_weighted_reporting_only": (
                         run.result.best_ont_matrix_kl_count_weighted
                     ),
@@ -4326,7 +4694,7 @@ def _write_run(
                     "validation_compatible_path_nll",
                     "ont_matrix_kl_count_weighted",
                 ],
-                "checkpoint_selection_metric": ("validation_compatible_path_nll"),
+                "checkpoint_selection_metric": selection_metric,
                 "reporting_only_metric": "ont_matrix_kl_count_weighted",
                 "completed_epoch_count": expected_monitor_records,
                 "record_count": len(monitor_rows),
