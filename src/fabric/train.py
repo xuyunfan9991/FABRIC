@@ -4073,10 +4073,39 @@ def _write_recovery_history(
     _atomic_write_text(run_dir / "sealed_validation_monitor.jsonl", monitor_text)
 
 
+def _snapshot_completed_epoch(
+    run_dir: Path, checkpoint: Mapping[str, object], *, backfill: bool = False
+) -> None:
+    """Keep one immutable checkpoint per completed epoch.
+
+    latest.pt is overwritten in place every epoch, so without these per-epoch
+    copies any metric that needs a forward pass (e.g. ONT top-1) could only
+    ever be computed for the final model.  latest.pt is self-contained, so one
+    file per epoch is enough.  Snapshots are append-only: an existing epoch
+    file can only mean the run was resumed from a checkpoint other than its
+    own latest.pt, which the resume path forbids.
+    """
+    epoch_dir = run_dir / "epoch_checkpoints"
+    epoch_dir.mkdir(exist_ok=True)
+    epoch_path = epoch_dir / f"epoch_{int(checkpoint['completed_epoch'])}.pt"
+    if epoch_path.exists():
+        if backfill:
+            return
+        raise FileExistsError(
+            f"per-epoch checkpoint {epoch_path} already exists and snapshots "
+            "are immutable; epoch numbers can only repeat when a run is "
+            "resumed from a checkpoint other than its own latest.pt"
+        )
+    _atomic_torch_save(checkpoint, epoch_path)
+
+
 def _reconcile_recovery_artifacts(
     run_dir: Path, checkpoint: Mapping[str, object]
 ) -> None:
     _atomic_torch_save(_best_checkpoint_from_recovery(checkpoint), run_dir / "best.pt")
+    # Heal the crash window between the latest.pt commit and the epoch
+    # snapshot: the validated resume checkpoint is that epoch's state.
+    _snapshot_completed_epoch(run_dir, checkpoint, backfill=True)
     _write_recovery_history(run_dir, checkpoint)
 
 
@@ -4094,8 +4123,10 @@ def _persist_epoch_recovery(
         **dict(state),
     }
     # latest.pt is self-contained, including the selected best state.  Its
-    # atomic replacement is therefore the sole recovery commit point.
+    # atomic replacement is therefore the sole recovery commit point; the
+    # per-epoch snapshot below it is healed on resume if a crash lands between.
     _atomic_torch_save(checkpoint, run_dir / "latest.pt")
+    _snapshot_completed_epoch(run_dir, checkpoint)
     if checkpoint["best_improved_this_epoch"] is True:
         _atomic_torch_save(
             _best_checkpoint_from_recovery(checkpoint), run_dir / "best.pt"
