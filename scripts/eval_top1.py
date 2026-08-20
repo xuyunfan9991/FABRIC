@@ -272,6 +272,11 @@ def main() -> int:
             continue
         started = time.time()
         checkpoint = torch.load(available[epoch], map_location="cpu", weights_only=False)
+        if int(checkpoint["completed_epoch"]) != epoch:
+            raise AssertionError(
+                f"snapshot {available[epoch].name} holds completed_epoch="
+                f"{checkpoint['completed_epoch']}, expected {epoch}"
+            )
         model.load_state_dict(checkpoint["model_state_dict"])
 
         snapshot = _evaluate_split(

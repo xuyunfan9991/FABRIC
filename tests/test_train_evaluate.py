@@ -905,6 +905,48 @@ def test_completed_epoch_resume_exactly_matches_uninterrupted_training(
     assert (interrupted_dir / "checkpoint.pt").is_file()
 
 
+def test_per_epoch_checkpoints_saved_natively(tmp_path):
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 3
+    config["training"]["early_stopping_patience"] = 3
+    first = make_toy_genes(seed=23)[0]
+    genes = [first, replace(first, gene_id="TOY_GENE_2")]
+    run_dir = tmp_path / "native_snapshots"
+    train_run(
+        genes, config, seed=42, condition="full", device="cpu", run_dir=run_dir
+    )
+
+    epoch_dir = run_dir / "epoch_checkpoints"
+    assert sorted(path.name for path in epoch_dir.glob("*.pt")) == [
+        "epoch_1.pt",
+        "epoch_2.pt",
+        "epoch_3.pt",
+    ]
+    for epoch in (1, 2, 3):
+        snapshot = torch.load(
+            epoch_dir / f"epoch_{epoch}.pt", map_location="cpu", weights_only=False
+        )
+        assert snapshot["schema_version"] == "fabric.training_recovery_checkpoint.v1"
+        assert snapshot["completed_epoch"] == epoch
+    latest = torch.load(
+        run_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    for name, value in latest["model_state_dict"].items():
+        torch.testing.assert_close(
+            snapshot["model_state_dict"][name], value, atol=0, rtol=0
+        )
+
+    with pytest.raises(FileExistsError, match="immutable"):
+        train_module._snapshot_completed_epoch(run_dir, latest)
+
+    (epoch_dir / "epoch_3.pt").unlink()
+    train_module._reconcile_recovery_artifacts(run_dir, latest)
+    restored = torch.load(
+        epoch_dir / "epoch_3.pt", map_location="cpu", weights_only=False
+    )
+    assert restored["completed_epoch"] == 3
+
+
 def test_resume_rejects_best_checkpoint_and_identity_or_state_drift(
     tmp_path, monkeypatch
 ):

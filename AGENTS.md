@@ -17,11 +17,11 @@ FABRIC（Factor-Aware Branch Regulation of Isoform Choice）是一个基因级�
 | `tests/` | tracked | Pytest 测试套件。`tests/fixtures/real/` 存放已提交的小型 parquet fixture。 | 新测试按 `test_<module>.py` 的命名模式与模块对应。 |
 | `configs/` | tracked | YAML 运行配置。每个文件是**一次已授权运行设置的记录**（带 `training_authorized` / `final_test_authorized` 标志）。 | 新运行 ⇒ 新文件。已完成运行用过的 config 永不修改。 |
 | `docs/` | tracked | 架构契约文档。 | V2 文档是权威；只有真实设计变更才更新它。 |
-| `scripts/` | tracked | 事后分析、绘图与运维脚本（top-1 评估、DTU 重算、checkpoint 快照守护进程）。 | **必须从 repo 根目录运行**——相对路径默认 CWD 为 repo 根。新分析代码写在这里（并提交），绝不放 `tmp/`。产物写入 `outputs/analysis/`。 |
+| `scripts/` | tracked | 事后分析与绘图脚本（top-1 评估、DTU 重算）。 | **必须从 repo 根目录运行**——相对路径默认 CWD 为 repo 根。新分析代码写在这里（并提交），绝不放 `tmp/`。产物写入 `outputs/analysis/`。 |
 | `refine-logs/` | tracked | FINAL_PROPOSAL.md、EXPERIMENT_PLAN.md、EXPERIMENT_TRACKER.md、评审轮次记录。 | 实验推进时追加/更新 tracker 行。 |
 | `sources/` | tracked | 文献调研笔记（markdown）。 | 新调研笔记放这里。 |
 | `data/` | 混合 | 见下方细分。 | |
-| `runs/` | **ignored** | 训练输出，每次运行一个目录：`fabric_v2_<variant>_seed<seed>/`，旁边是同名 `<name>.log`。`runs/checkpoint_snapshots/<run>/epoch_N.pt` 保存逐 epoch 权重（train.py 会原地覆盖 `latest.pt`）。 | **只增不删。**永不删除、重命名或覆盖已有的 run 目录或快照。只有 `train.py`（或快照守护进程）向这里写入。 |
+| `runs/` | **ignored** | 训练输出，每次运行一个目录：`fabric_v2_<variant>_seed<seed>/`，旁边是同名 `<name>.log`。`train.py` 每个 epoch 原生保存 `runs/<run>/epoch_checkpoints/epoch_N.pt`（`latest.pt` 仍原地覆盖，是恢复提交点）。`runs/checkpoint_snapshots/<短名>/epoch_N.pt` 是已退役快照守护进程的历史产物（macro 双臂 e1–e10 在此），按只增不删保留。 | **只增不删。**永不删除、重命名或覆盖已有的 run 目录或快照。只有 `train.py` 向这里写入。 |
 | `outputs/` | **ignored** | `validation/` = 就绪/授权验证日志；`analysis/` = `scripts/` 产出的衍生分析产物（per-gene TSV、top-1 JSONL、图 PNG）。 | 可再生但需消耗 GPU——不要随手删。只有分析脚本向这里写入。 |
 | `tmp/` | **ignored** | 真正的草稿区。随时可删，删了无损失。 | 任何丢了会心疼的东西都**不**属于这里。 |
 | `paper/` | **ignored** | 外部参考 PDF / 合作者手稿（输入材料，不是产物）。 | 只读参考材料。 |
