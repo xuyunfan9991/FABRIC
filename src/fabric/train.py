@@ -2269,6 +2269,92 @@ def _condition_profile_path(
     return Path(profile_path)
 
 
+def _assert_condition_profile_batch_structure(
+    profile: Mapping[str, object],
+) -> None:
+    """Verify that a v1 artifact actually contains both profiled runtime phases."""
+
+    batches = profile.get("profile_batches")
+    if not isinstance(batches, list) or not batches:
+        raise RuntimeError("condition resource profile has no profiled batches")
+    train_batches = [
+        value
+        for value in batches
+        if isinstance(value, Mapping) and value.get("phase") == "train"
+    ]
+    evaluation_batches = [
+        value
+        for value in batches
+        if isinstance(value, Mapping) and value.get("phase") == "evaluation"
+    ]
+    train_gene_ids = {value.get("gene_id") for value in train_batches}
+    evaluation_gene_ids = {value.get("gene_id") for value in evaluation_batches}
+    train_allocated = [
+        value.get("peak_gpu_allocated_bytes") for value in train_batches
+    ]
+    evaluation_allocated = [
+        value.get("peak_gpu_allocated_bytes") for value in evaluation_batches
+    ]
+    train_reserved = [value.get("peak_gpu_reserved_bytes") for value in train_batches]
+    evaluation_reserved = [
+        value.get("peak_gpu_reserved_bytes") for value in evaluation_batches
+    ]
+    if (
+        len(train_batches) != len(evaluation_batches)
+        or len(train_batches) != profile.get("profile_train_batch_count")
+        or len(evaluation_batches) != profile.get("profile_evaluation_batch_count")
+        or len(batches) != profile.get("profile_batch_count")
+        or train_gene_ids != evaluation_gene_ids
+        or None in train_gene_ids
+        or any(type(value) is not int for value in train_allocated + evaluation_allocated)
+        or any(type(value) is not int for value in train_reserved + evaluation_reserved)
+        or any(
+            value.get("split") != "train"
+            or value.get("model_mode") != "train"
+            or value.get("profile_shape_role")
+            != "highest_ec_row_count_capped_train_sample"
+            or not isinstance(value.get("gradient_audit"), Mapping)
+            or value.get("gradient_audit", {}).get("mode") != "backward"
+            or value.get("gradient_audit", {}).get("backward_called") is not True
+            or value.get("gradient_audit", {}).get("passed") is not True
+            for value in train_batches
+        )
+        or any(
+            value.get("split") != "validation"
+            or value.get("model_mode") != "eval"
+            or value.get("profile_shape_role")
+            != "complete_validation_largest_estimated_batch"
+            or not isinstance(value.get("gradient_audit"), Mapping)
+            or value.get("gradient_audit", {}).get("mode")
+            != "evaluation_no_grad"
+            or value.get("gradient_audit", {}).get("backward_called") is not False
+            or value.get("gradient_audit", {}).get("autograd_enabled_during_forward")
+            is not False
+            or value.get("gradient_audit", {}).get("passed") is not True
+            for value in evaluation_batches
+        )
+        or any(
+            value.get("peak_gpu_allocated_bytes", 1)
+            > value.get("adaptive_estimated_gpu_bytes", 0)
+            for value in batches
+            if isinstance(value, Mapping)
+        )
+        or max(train_allocated + evaluation_allocated)
+        != profile.get("maximum_profile_peak_gpu_allocated_bytes")
+        or max(train_reserved + evaluation_reserved)
+        != profile.get("maximum_profile_peak_gpu_reserved_bytes")
+        or max(train_allocated)
+        != profile.get("maximum_train_profile_peak_gpu_allocated_bytes")
+        or max(evaluation_allocated)
+        != profile.get("maximum_evaluation_profile_peak_gpu_allocated_bytes")
+        or max(train_reserved)
+        != profile.get("maximum_train_profile_peak_gpu_reserved_bytes")
+        or max(evaluation_reserved)
+        != profile.get("maximum_evaluation_profile_peak_gpu_reserved_bytes")
+    ):
+        raise RuntimeError("condition resource profile batch structure differs")
+
+
 def assert_execution_admitted(
     config: Mapping[str, object], *, condition: str
 ) -> None:
@@ -2329,6 +2415,18 @@ def assert_execution_admitted(
             profile_schema == "fabric.real_condition_shape_profile.v1"
             and profile.get("profiled_model_condition")
             != _MODEL_CONDITION[condition]
+        )
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and (
+                profile.get("profiled_model_config") != config.get("model")
+                or profile.get("input_manifest_id")
+                != config["inputs"].get("input_manifest_id")
+                or profile.get("compatibility_artifact_id")
+                != config["inputs"].get("compatibility_artifact_id")
+                or profile.get("profile_source_git_commit")
+                != committed_source_identity(require_clean=False)
+            )
         )
         or profile.get("gpu_name") != resources.get("gpu_model")
         or profile.get("gpu_total_memory_bytes")
@@ -2407,6 +2505,8 @@ def assert_execution_admitted(
         )
     ):
         raise RuntimeError("resource profile violates the launch boundary")
+    if profile_schema == "fabric.real_condition_shape_profile.v1":
+        _assert_condition_profile_batch_structure(profile)
     if (
         validation.get("status") != "ADMITTED_FOR_PRELAUNCH"
         or validation.get("g_fit_gene_count") != 17_600

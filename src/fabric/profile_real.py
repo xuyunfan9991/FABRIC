@@ -17,6 +17,7 @@ from scipy.optimize import nnls
 
 from .likelihood import compatible_path_nll
 from .model import FABRICV2Model
+from .source_identity import committed_source_identity
 from .train import (
     BackedPreparedDataset,
     FULL_COHORT_SCOPE,
@@ -30,6 +31,7 @@ from .train import (
     _model_spec,
     _plan_gene_cell_batches,
     _subset_gene_cells,
+    _validate_prepared_dataset_identity,
     load_config,
     rows_for_split,
 )
@@ -667,6 +669,7 @@ def profile_real_batches(
     if condition not in RUN_CONDITIONS:
         raise ValueError(f"profile condition must be one of {RUN_CONDITIONS}")
     prepared = BackedPreparedDataset.load(prepared_root)
+    _validate_prepared_dataset_identity(prepared, config)
     manifest = json.loads((prepared_root / "PreparedDatasetManifest.json").read_text())
     records = manifest["gene_record_audit"]
     resources = dict(config["resources"])
@@ -1013,6 +1016,10 @@ def profile_real_batches(
         "scope": FULL_COHORT_SCOPE,
         "profiled_condition": condition,
         "profiled_model_condition": _MODEL_CONDITION[condition],
+        "profiled_model_config": dict(model_config),
+        "input_manifest_id": prepared.input_manifest_id,
+        "compatibility_artifact_id": prepared.compatibility_artifact_id,
+        "profile_source_git_commit": committed_source_identity(require_clean=True),
         "profile_initialization_seed": 1103,
         "epoch_evaluation_policy": (
             "projected_complete_train_and_validation_from_profiled_batches"

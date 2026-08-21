@@ -10,10 +10,12 @@ from pathlib import Path
 import shlex
 from typing import Sequence
 
+from .source_identity import committed_source_identity
 from .train import (
     FULL_COHORT_SCOPE,
     RUN_CONDITIONS,
     _MODEL_CONDITION,
+    _assert_condition_profile_batch_structure,
     _checkpoint_selection_metric,
     load_config,
 )
@@ -112,6 +114,18 @@ def build_readiness_report(
             and profile.get("profiled_model_condition")
             != _MODEL_CONDITION[condition]
         )
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and (
+                profile.get("profiled_model_config") != config.get("model")
+                or profile.get("input_manifest_id")
+                != config["inputs"].get("input_manifest_id")
+                or profile.get("compatibility_artifact_id")
+                != config["inputs"].get("compatibility_artifact_id")
+                or profile.get("profile_source_git_commit")
+                != committed_source_identity(require_clean=False)
+            )
+        )
         or profile.get("gpu_name") != config["resources"].get("gpu_model")
         or profile.get("gpu_total_memory_bytes")
         != config["resources"].get("gpu_total_memory_bytes")
@@ -178,6 +192,11 @@ def build_readiness_report(
         )
     ):
         raise ValueError("resource profile train sampling identity differs")
+    if profile_schema == "fabric.real_condition_shape_profile.v1":
+        try:
+            _assert_condition_profile_batch_structure(profile)
+        except RuntimeError as error:
+            raise ValueError("resource profile batch structure differs") from error
     if any(
         profile.get(name) is not False
         for name in (

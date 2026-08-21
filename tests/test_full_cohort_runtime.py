@@ -40,6 +40,80 @@ from fabric.train import (
 from fabric.train import _configure_cuda_allocator, _iter_gene_order
 
 
+def _as_condition_profile_v1(profile, config, *, condition):
+    result = deepcopy(profile)
+    allocated = int(result["maximum_profile_peak_gpu_allocated_bytes"])
+    reserved = int(result.get("maximum_profile_peak_gpu_reserved_bytes", allocated))
+    gene_id = "profile_fixture_gene"
+    common = {
+        "gene_id": gene_id,
+        "peak_gpu_allocated_bytes": allocated,
+        "peak_gpu_reserved_bytes": reserved,
+        "adaptive_estimated_gpu_bytes": allocated,
+    }
+    result.update(
+        {
+            "schema_version": "fabric.real_condition_shape_profile.v1",
+            "profiled_condition": condition,
+            "profiled_model_condition": _MODEL_CONDITION[condition],
+            "profiled_model_config": deepcopy(config["model"]),
+            "input_manifest_id": config["inputs"]["input_manifest_id"],
+            "compatibility_artifact_id": config["inputs"][
+                "compatibility_artifact_id"
+            ],
+            "profile_source_git_commit": committed_source_identity(
+                require_clean=False
+            ),
+            "epoch_evaluation_policy": (
+                "projected_complete_train_and_validation_from_profiled_batches"
+            ),
+            "profile_execution_policy": (
+                "selected_train_backward_and_validation_no_grad_batches"
+            ),
+            "profile_batches": [
+                {
+                    **common,
+                    "phase": "train",
+                    "split": "train",
+                    "model_mode": "train",
+                    "profile_shape_role": (
+                        "highest_ec_row_count_capped_train_sample"
+                    ),
+                    "gradient_audit": {
+                        "mode": "backward",
+                        "backward_called": True,
+                        "passed": True,
+                    },
+                },
+                {
+                    **common,
+                    "phase": "evaluation",
+                    "split": "validation",
+                    "model_mode": "eval",
+                    "profile_shape_role": (
+                        "complete_validation_largest_estimated_batch"
+                    ),
+                    "gradient_audit": {
+                        "mode": "evaluation_no_grad",
+                        "backward_called": False,
+                        "autograd_enabled_during_forward": False,
+                        "passed": True,
+                    },
+                },
+            ],
+            "profile_batch_count": 2,
+            "profile_train_batch_count": 1,
+            "profile_evaluation_batch_count": 1,
+            "maximum_profile_peak_gpu_reserved_bytes": reserved,
+            "maximum_train_profile_peak_gpu_allocated_bytes": allocated,
+            "maximum_evaluation_profile_peak_gpu_allocated_bytes": allocated,
+            "maximum_train_profile_peak_gpu_reserved_bytes": reserved,
+            "maximum_evaluation_profile_peak_gpu_reserved_bytes": reserved,
+        }
+    )
+    return result
+
+
 def test_source_identity_tracks_the_committed_source_tree():
     expected = subprocess.run(
         ["git", "log", "-1", "--format=%H", "--", "src/fabric"],
@@ -128,15 +202,8 @@ def test_condition_profile_admission_selects_and_verifies_the_exact_condition(
     )
     profile_paths = {}
     for condition in RUN_CONDITIONS:
-        profile = deepcopy(legacy_profile)
-        profile["schema_version"] = "fabric.real_condition_shape_profile.v1"
-        profile["profiled_condition"] = condition
-        profile["profiled_model_condition"] = _MODEL_CONDITION[condition]
-        profile["epoch_evaluation_policy"] = (
-            "projected_complete_train_and_validation_from_profiled_batches"
-        )
-        profile["profile_execution_policy"] = (
-            "selected_train_backward_and_validation_no_grad_batches"
+        profile = _as_condition_profile_v1(
+            legacy_profile, config, condition=condition
         )
         path = tmp_path / f"ResourceProfile.{condition}.json"
         path.write_text(json.dumps(profile))
@@ -163,6 +230,36 @@ def test_condition_profile_admission_selects_and_verifies_the_exact_condition(
         wrong_internal["resources"]["profile_artifact"] = str(wrong_path)
         with pytest.raises(RuntimeError, match="launch boundary"):
             assert_execution_admitted(wrong_internal, condition=condition)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("model", "input", "compatibility", "source", "evaluation_phase"),
+)
+def test_condition_profile_binds_model_data_source_and_both_runtime_phases(
+    tmp_path, tamper
+):
+    config = load_config("configs/fabric_v2_full_cohort.yaml")
+    profile = _as_condition_profile_v1(
+        json.loads(Path(config["resources"]["profile_artifact"]).read_text()),
+        config,
+        condition="full",
+    )
+    if tamper == "model":
+        profile["profiled_model_config"]["hidden_dim"] += 1
+    elif tamper == "input":
+        profile["input_manifest_id"] = "different_input"
+    elif tamper == "compatibility":
+        profile["compatibility_artifact_id"] = "different_compatibility"
+    elif tamper == "source":
+        profile["profile_source_git_commit"] = "different_source"
+    else:
+        profile["profile_batches"][1]["phase"] = "train"
+    path = tmp_path / f"ResourceProfile.full.{tamper}.json"
+    path.write_text(json.dumps(profile))
+    config["resources"]["profile_artifact"] = str(path)
+    with pytest.raises(RuntimeError, match="launch boundary|batch structure"):
+        assert_execution_admitted(config, condition="full")
 
 
 def test_cuda_allocator_limit_is_validated_and_frozen_in_the_run_manifest(tmp_path):
@@ -227,23 +324,23 @@ def test_admission_rejects_a_profile_whose_reserved_peak_exceeds_the_allocator_l
     tmp_path,
 ):
     config = load_config("configs/fabric_v2_full_cohort.yaml")
-    profile = json.loads(Path(config["resources"]["profile_artifact"]).read_text())
+    profile = _as_condition_profile_v1(
+        json.loads(Path(config["resources"]["profile_artifact"]).read_text()),
+        config,
+        condition="full",
+    )
     allocator_limit = 22 << 30
     config["resources"]["cuda_allocator_limit_bytes"] = allocator_limit
     profile.update(
         {
-            "schema_version": "fabric.real_condition_shape_profile.v1",
-            "profiled_model_condition": _MODEL_CONDITION["full"],
-            "epoch_evaluation_policy": (
-                "projected_complete_train_and_validation_from_profiled_batches"
-            ),
-            "profile_execution_policy": (
-                "selected_train_backward_and_validation_no_grad_batches"
-            ),
             "cuda_allocator_limit_bytes": allocator_limit,
             "maximum_profile_peak_gpu_reserved_bytes": allocator_limit,
+            "maximum_train_profile_peak_gpu_reserved_bytes": allocator_limit,
+            "maximum_evaluation_profile_peak_gpu_reserved_bytes": allocator_limit,
         }
     )
+    for value in profile["profile_batches"]:
+        value["peak_gpu_reserved_bytes"] = allocator_limit
     profile_path = tmp_path / "ResourceProfile.full.json"
     profile_path.write_text(json.dumps(profile))
     config["resources"]["profile_artifact"] = str(profile_path)
@@ -255,9 +352,13 @@ def test_admission_rejects_a_profile_whose_reserved_peak_exceeds_the_allocator_l
         assert_execution_admitted(config, condition="full")
 
     profile["maximum_profile_peak_gpu_reserved_bytes"] = allocator_limit
-    profile["maximum_profile_peak_gpu_allocated_bytes"] = config["resources"][
-        "target_gpu_allocated_bytes"
-    ]
+    allocated = config["resources"]["target_gpu_allocated_bytes"]
+    profile["maximum_profile_peak_gpu_allocated_bytes"] = allocated
+    profile["maximum_train_profile_peak_gpu_allocated_bytes"] = allocated
+    profile["maximum_evaluation_profile_peak_gpu_allocated_bytes"] = allocated
+    for value in profile["profile_batches"]:
+        value["peak_gpu_allocated_bytes"] = allocated
+        value["adaptive_estimated_gpu_bytes"] = allocated
     profile["frozen_host_ram_requirement_bytes"] = (
         config["resources"]["frozen_host_ram_requirement_bytes"] + 1
     )
@@ -268,9 +369,13 @@ def test_admission_rejects_a_profile_whose_reserved_peak_exceeds_the_allocator_l
     profile["frozen_host_ram_requirement_bytes"] = config["resources"][
         "frozen_host_ram_requirement_bytes"
     ]
-    profile["maximum_profile_peak_gpu_allocated_bytes"] = (
-        config["resources"]["target_gpu_allocated_bytes"] + 1
-    )
+    allocated += 1
+    profile["maximum_profile_peak_gpu_allocated_bytes"] = allocated
+    profile["maximum_train_profile_peak_gpu_allocated_bytes"] = allocated
+    profile["maximum_evaluation_profile_peak_gpu_allocated_bytes"] = allocated
+    for value in profile["profile_batches"]:
+        value["peak_gpu_allocated_bytes"] = allocated
+        value["adaptive_estimated_gpu_bytes"] = allocated
     profile_path.write_text(json.dumps(profile))
     with pytest.raises(RuntimeError, match="launch boundary"):
         assert_execution_admitted(config, condition="full")
