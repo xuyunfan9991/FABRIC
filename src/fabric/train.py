@@ -288,6 +288,7 @@ class TrainingRunManifest:
     gene_microbatch_gradient_accumulation: bool
     batch_policy: str
     target_gpu_allocated_bytes: int
+    cuda_allocator_limit_bytes: int | None
     max_cells_per_gpu_batch: int
     prefetch_backed_gene_shards: bool
     compute_precision: str
@@ -392,6 +393,13 @@ class TrainingRunManifest:
             or self.target_gpu_allocated_bytes < 1
         ):
             raise ValueError("TrainingRunManifest GPU target must be positive")
+        if self.cuda_allocator_limit_bytes is not None and (
+            type(self.cuda_allocator_limit_bytes) is not int
+            or self.cuda_allocator_limit_bytes < self.target_gpu_allocated_bytes
+        ):
+            raise ValueError(
+                "TrainingRunManifest CUDA allocator limit must cover the GPU target"
+            )
         if (
             type(self.max_cells_per_gpu_batch) is not int
             or self.max_cells_per_gpu_batch < 1
@@ -2017,6 +2025,20 @@ def load_config(path: str | Path) -> dict[str, object]:
         or gpu_total < resources["target_gpu_allocated_bytes"]
     ):
         raise ValueError("GPU total memory must cover the adaptive allocation target")
+    allocator_limit = resources.get("cuda_allocator_limit_bytes")
+    if allocator_limit is not None and (
+        type(allocator_limit) is not int
+        or allocator_limit < resources["target_gpu_allocated_bytes"]
+        or (gpu_total is not None and allocator_limit > gpu_total)
+    ):
+        raise ValueError(
+            "resources.cuda_allocator_limit_bytes must cover the target and fit the GPU"
+        )
+    profile_artifact = resources.get("profile_artifact")
+    if profile_artifact is not None and (
+        not isinstance(profile_artifact, str) or not profile_artifact.strip()
+    ):
+        raise ValueError("resources.profile_artifact must be a nonempty path")
     batching_tolerance = resources.get("batching_probability_tolerance")
     if (
         isinstance(batching_tolerance, bool)
@@ -2207,6 +2229,11 @@ def training_manifest_from_config(
         ],
         batch_policy=str(resources["batch_policy"]),
         target_gpu_allocated_bytes=int(resources["target_gpu_allocated_bytes"]),
+        cuda_allocator_limit_bytes=(
+            None
+            if resources.get("cuda_allocator_limit_bytes") is None
+            else int(resources["cuda_allocator_limit_bytes"])
+        ),
         max_cells_per_gpu_batch=int(resources["max_cells_per_gpu_batch"]),
         prefetch_backed_gene_shards=resources["prefetch_backed_gene_shards"],
         compute_precision=str(resources["compute_precision"]),
@@ -2231,8 +2258,19 @@ def training_manifest_from_config(
     return manifest
 
 
+def _condition_profile_path(
+    resources: Mapping[str, object], condition: str
+) -> Path:
+    if condition not in RUN_CONDITIONS:
+        raise ValueError(f"run condition must be one of {RUN_CONDITIONS}")
+    profile_path = resources.get("profile_artifact")
+    if not isinstance(profile_path, str) or not Path(profile_path).is_file():
+        raise RuntimeError("condition resource profile artifact is absent")
+    return Path(profile_path)
+
+
 def assert_execution_admitted(
-    config: Mapping[str, object],
+    config: Mapping[str, object], *, condition: str
 ) -> None:
     """Reject a full-cohort launch before filesystem, model, or GPU use."""
 
@@ -2254,26 +2292,55 @@ def assert_execution_admitted(
         raise RuntimeError("real full-shape profile is not frozen")
     if resources.get("validation_status") != "FROZEN_STRICT_REAL_VALIDATION":
         raise RuntimeError("strict real-dataset validation is not frozen")
-    profile_path = resources.get("profile_artifact")
+    profile_path = _condition_profile_path(resources, condition)
     validation_path = resources.get("validation_artifact")
-    if not isinstance(profile_path, str) or not Path(profile_path).is_file():
-        raise RuntimeError("resource profile artifact is absent")
     if not isinstance(validation_path, str) or not Path(validation_path).is_file():
         raise RuntimeError("strict validation artifact is absent")
-    profile = json.loads(Path(profile_path).read_text())
+    profile = json.loads(profile_path.read_text())
     validation = json.loads(Path(validation_path).read_text())
     training = config["training"]
+    profile_schema = profile.get("schema_version")
+    expected_selection_metric = (
+        "validation_compatible_path_nll"
+        if profile_schema == "fabric.real_full_shape_profile.v3"
+        else _checkpoint_selection_metric(
+            str(training.get("gene_objective", "molecule_weighted"))
+        )
+    )
+    expected_epoch_evaluation_policy = (
+        "one_complete_validation_no_complete_train"
+        if profile_schema == "fabric.real_full_shape_profile.v3"
+        else "projected_complete_train_and_validation_from_profiled_batches"
+    )
     if (
-        profile.get("schema_version") != "fabric.real_full_shape_profile.v3"
+        profile_schema
+        not in {
+            "fabric.real_full_shape_profile.v3",
+            "fabric.real_condition_shape_profile.v1",
+        }
+        or (
+            profile_schema == "fabric.real_full_shape_profile.v3"
+            and condition != "full"
+        )
         or profile.get("status") != "FROZEN_REAL_FULL_SHAPE_PROFILE"
         or profile.get("scope") != FULL_COHORT_SCOPE
-        or profile.get("profiled_condition") != "full"
+        or profile.get("profiled_condition") != condition
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and profile.get("profiled_model_condition")
+            != _MODEL_CONDITION[condition]
+        )
+        or profile.get("gpu_name") != resources.get("gpu_model")
+        or profile.get("gpu_total_memory_bytes")
+        != resources.get("gpu_total_memory_bytes")
         or profile.get("batch_policy") != resources.get("batch_policy")
         or profile.get("compute_precision") != resources.get("compute_precision")
         or profile.get("prefetch_backed_gene_shards")
         is not resources.get("prefetch_backed_gene_shards")
         or profile.get("target_gpu_allocated_bytes")
         != resources.get("target_gpu_allocated_bytes")
+        or profile.get("cuda_allocator_limit_bytes")
+        != resources.get("cuda_allocator_limit_bytes")
         or profile.get("unmodeled_gpu_reserve_bytes")
         != resources.get("unmodeled_gpu_reserve_bytes")
         or profile.get("max_cells_per_gpu_batch")
@@ -2296,15 +2363,38 @@ def assert_execution_admitted(
         or profile.get("projected_optimizer_step_count_per_epoch")
         != config["inputs"]["g_fit_gene_count"]
         or profile.get("epoch_evaluation_policy")
-        != "one_complete_validation_no_complete_train"
+        != expected_epoch_evaluation_policy
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and profile.get("profile_execution_policy")
+            != "selected_train_backward_and_validation_no_grad_batches"
+        )
         or profile.get("epoch_core_metrics")
         != ["validation_compatible_path_nll", "ont_matrix_kl_count_weighted"]
         or profile.get("checkpoint_selection_metric")
-        != "validation_compatible_path_nll"
+        != expected_selection_metric
         or profile.get("reporting_only_metric") != "ont_matrix_kl_count_weighted"
         or profile.get("ont_validation_target_root") != config["monitor"]["target_root"]
         or profile.get("adaptive_memory_estimate_upper_bounds_all_profiled_batches")
         is not True
+        or (
+            type(profile.get("maximum_profile_peak_gpu_allocated_bytes")) is not int
+            or profile["maximum_profile_peak_gpu_allocated_bytes"]
+            > resources["target_gpu_allocated_bytes"]
+        )
+        or (
+            type(profile.get("frozen_host_ram_requirement_bytes")) is not int
+            or profile["frozen_host_ram_requirement_bytes"]
+            > resources["frozen_host_ram_requirement_bytes"]
+        )
+        or (
+            resources.get("cuda_allocator_limit_bytes") is not None
+            and (
+                type(profile.get("maximum_profile_peak_gpu_reserved_bytes")) is not int
+                or profile["maximum_profile_peak_gpu_reserved_bytes"]
+                > resources["cuda_allocator_limit_bytes"]
+            )
+        )
         or any(
             profile.get(name) is not False
             for name in (
@@ -2599,6 +2689,21 @@ def build_lr_scheduler(
     )
 
 
+def _configure_cuda_allocator(
+    device: torch.device, resources: Mapping[str, object]
+) -> int | None:
+    """Apply the run's hard caching-allocator ceiling before model allocation."""
+
+    limit = resources.get("cuda_allocator_limit_bytes")
+    if limit is None:
+        return None
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    if type(limit) is not int or not 0 < limit <= total:
+        raise ValueError("CUDA allocator limit must be a positive device-sized integer")
+    torch.cuda.set_per_process_memory_fraction(limit / total, device=device)
+    return limit
+
+
 def _optimizer_learning_rate(optimizer: torch.optim.Optimizer) -> float:
     rates = {float(group["lr"]) for group in optimizer.param_groups}
     if len(rates) != 1:
@@ -2693,7 +2798,7 @@ def train_run(
     """Train one seed/condition, optionally resuming after a completed epoch."""
 
     manifest = training_manifest_from_config(config, seed=seed, condition=condition)
-    assert_execution_admitted(config)
+    assert_execution_admitted(config, condition=condition)
     prepared = (
         data if isinstance(data, (PreparedDataset, BackedPreparedDataset)) else None
     )
@@ -2723,15 +2828,27 @@ def train_run(
         and config["execution"]["scope"] == FULL_COHORT_SCOPE
     ):
         resources = config["resources"]
+        _configure_cuda_allocator(torch_device, resources)
         actual_total = int(torch.cuda.get_device_properties(torch_device).total_memory)
-        if actual_total != int(resources["gpu_total_memory_bytes"]):
+        actual_name = torch.cuda.get_device_name(torch_device)
+        if (
+            actual_total != int(resources["gpu_total_memory_bytes"])
+            or actual_name != resources["gpu_model"]
+        ):
             raise RuntimeError(
-                "runtime GPU total memory differs from the frozen profile"
+                "runtime GPU differs from the frozen profile hardware identity"
             )
         free_bytes = int(torch.cuda.mem_get_info(torch_device)[0])
-        if free_bytes < int(resources["target_gpu_allocated_bytes"]):
+        required_free_bytes = max(
+            int(resources["target_gpu_allocated_bytes"]),
+            int(
+                resources.get("cuda_allocator_limit_bytes")
+                or resources["target_gpu_allocated_bytes"]
+            ),
+        )
+        if free_bytes < required_free_bytes:
             raise RuntimeError(
-                "runtime GPU is shared or lacks the frozen adaptive-batch target memory"
+                "runtime GPU lacks the frozen adaptive-batch and allocator allowance"
             )
     if resume_from is not None and run_dir is None:
         raise ValueError("resume_from requires the original run_dir")
@@ -4568,6 +4685,9 @@ def _write_run(
                     "target_gpu_allocated_bytes": config["resources"][
                         "target_gpu_allocated_bytes"
                     ],
+                    "cuda_allocator_limit_bytes": config["resources"].get(
+                        "cuda_allocator_limit_bytes"
+                    ),
                     "unmodeled_gpu_reserve_bytes": config["resources"][
                         "unmodeled_gpu_reserve_bytes"
                     ],
@@ -4802,7 +4922,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("toy execution requires --toy")
     if config["execution"]["scope"] != "toy" and args.toy:
         raise ValueError("non-toy execution requires --fixture")
-    assert_execution_admitted(config)
+    assert_execution_admitted(config, condition=args.condition)
     if args.toy:
         data: Sequence[PreparedGene] | PreparedDataset | BackedPreparedDataset = (
             make_toy_genes()
