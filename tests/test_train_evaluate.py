@@ -137,12 +137,20 @@ def _route_manifest(**overrides):
     )
 
 
-def test_multiple_ec_rows_reuse_one_gene_cell_forward_and_fixed_split_denominator():
+def test_multiple_ec_rows_reuse_one_gene_cell_forward_and_fixed_split_denominator(
+    monkeypatch,
+):
     gene = make_toy_genes()[0]
     config = _one_epoch_config()
     model = build_paired_models(gene, config["model"], seed=7, device="cpu")["full"]
     calls = []
-    handle = model.register_forward_hook(lambda *_: calls.append(1))
+    forward_logits = model.forward_logits
+
+    def counted_forward_logits(*args, **kwargs):
+        calls.append(1)
+        return forward_logits(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_logits", counted_forward_logits)
     snapshot = evaluate_split(
         [gene],
         model,
@@ -151,7 +159,6 @@ def test_multiple_ec_rows_reuse_one_gene_cell_forward_and_fixed_split_denominato
         model_config=config["model"],
         resources=config["resources"],
     )
-    handle.remove()
     assert len(calls) == 1
     assert snapshot.predictions[0].path_logits.shape[0] == 3
     assert snapshot.predictions[0].compatible_path_indices.shape[0] == 6
@@ -235,6 +242,20 @@ def test_prepared_gene_identity_and_integer_mass_contract_fails_closed():
     with pytest.raises(ValueError, match="left-aligned prefix"):
         _train_full(
             [replace(gene, compatible_path_mask=gapped_mask)],
+            _one_epoch_config(),
+            seed=101,
+            device="cpu",
+        )
+
+    route_weights = gene.model_input.dna.route_weight.clone()
+    route_weights[0] *= 0.5
+    invalid_model_input = replace(
+        gene.model_input,
+        dna=replace(gene.model_input.dna, route_weight=route_weights),
+    )
+    with pytest.raises(ValueError, match="route weights must sum to one"):
+        _train_full(
+            [replace(gene, model_input=invalid_model_input)],
             _one_epoch_config(),
             seed=101,
             device="cpu",
@@ -1294,3 +1315,210 @@ def test_python_module_cli_loads_exact_prepared_dataset_identity(tmp_path):
     assert manifest["learning_rate"] == 0.002
     assert manifest["lr_scheduler_name"] == "reduce_on_plateau"
     assert manifest["gradient_clip_norm"] == 0.7
+
+
+def _toy_model_input_variant(**overrides):
+    """Return one toy gene whose immutable model input violates a contract."""
+
+    gene = make_toy_genes()[0]
+    source = gene.model_input
+    if "dna" in overrides:
+        overrides["dna"] = replace(source.dna, **overrides.pop("dna"))
+    return replace(gene, model_input=replace(source, **overrides))
+
+
+def _incidence(indices, values, shape=(2, 7), coalesce=True):
+    result = torch.sparse_coo_tensor(
+        torch.tensor(indices, dtype=torch.long),
+        torch.tensor(values, dtype=torch.float32),
+        shape,
+    )
+    return result.coalesce() if coalesce else result
+
+
+_FULL_INCIDENCE = (
+    [[0, 0, 0, 0, 0, 1, 1, 1, 1, 1], [0, 1, 2, 3, 6, 0, 1, 4, 5, 6]],
+    [1.0] * 10,
+)
+
+
+# Every case below was enforced inside FABRICV2Model.forward on each batch
+# before the prevalidated logits path existed.  Training now trusts the shard
+# contract, so the load boundary is the only place these can still fail; each
+# one must fail there.
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"path_edge_incidence": _incidence(*(_FULL_INCIDENCE[0], [2.0] + [1.0] * 9))},
+            "binary unit entries",
+            id="incidence_non_binary",
+        ),
+        pytest.param(
+            {
+                "path_edge_incidence": _incidence(
+                    [[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0], [0, 1, 2, 3, 6, 0, 1, 4, 5, 6, 0]],
+                    [1.0] * 11,
+                    coalesce=False,
+                )
+            },
+            "duplicate edge entries",
+            id="incidence_duplicate_entries",
+        ),
+        pytest.param(
+            {
+                "path_edge_incidence": _incidence(
+                    [[0, 0, 0, 0, 0], [0, 1, 2, 3, 6]], [1.0] * 5
+                )
+            },
+            "at least one edge",
+            id="path_with_no_edge",
+        ),
+        pytest.param(
+            {"path_first_edge_index": torch.tensor([0, 99])},
+            "first-edge index is out of range",
+            id="first_edge_out_of_range",
+        ),
+        pytest.param(
+            {"path_last_edge_index": torch.tensor([6, 3])},
+            "last-edge index is not contained",
+            id="last_edge_outside_its_path",
+        ),
+        pytest.param(
+            {"log_edge_count": torch.log1p(torch.tensor([4.0, 5.0]))},
+            "log_edge_count differs from binary path incidence",
+            id="log_edge_count_inconsistent",
+        ),
+        pytest.param(
+            {"cis_features": torch.full((7, 6), float("inf"))},
+            "cis_features must be finite",
+            id="cis_features_non_finite",
+        ),
+        pytest.param(
+            {"local_edge_index": torch.tensor([[99, 1], [0, 1]])},
+            "local_edge_index is out of range",
+            id="local_edge_index_out_of_range",
+        ),
+        pytest.param(
+            {"dna": {"route_edge_index": torch.tensor([99, 4, 3, 5])}},
+            "route_edge_index is out of range",
+            id="route_edge_index_out_of_range",
+        ),
+        pytest.param(
+            {"dna": {"event_gate_key_index": torch.tensor([0, 5])}},
+            "event_gate_key_index is out of range",
+            id="event_gate_key_index_out_of_range",
+        ),
+        pytest.param(
+            {"dna": {"route_weight": torch.tensor([0.0, 1.0, 0.5, 0.5])}},
+            "strictly positive",
+            id="route_weight_not_positive",
+        ),
+        pytest.param(
+            {"dna": {"route_weight": torch.tensor([0.25, 0.5, 0.5, 0.5])}},
+            "route weights must sum to one",
+            id="route_weight_sum_differs",
+        ),
+    ],
+)
+def test_gene_load_boundary_rejects_every_hoisted_forward_invariant(
+    overrides, message
+):
+    gene = _toy_model_input_variant(**copy.deepcopy(overrides))
+    with pytest.raises((ValueError, TypeError, IndexError), match=message):
+        train_module._validate_genes([gene])
+    with pytest.raises((ValueError, TypeError, IndexError), match=message):
+        _train_full([gene], _one_epoch_config(), seed=101, device="cpu")
+
+
+def test_non_finite_gate_is_rejected_at_the_gene_load_boundary():
+    gene = make_toy_genes()[0]
+    gate = gene.model_input.dna.gate.clone()
+    gate[0, 0] = float("nan")
+    broken = replace(
+        gene,
+        model_input=replace(
+            gene.model_input, dna=replace(gene.model_input.dna, gate=gate)
+        ),
+    )
+    with pytest.raises(ValueError, match="non-finite model value"):
+        train_module._validate_genes([broken])
+
+
+def test_backed_shard_load_applies_the_same_boundary(tmp_path):
+    """The production shard path must reject what the forward no longer checks."""
+
+    broken = _toy_model_input_variant(path_first_edge_index=torch.tensor([0, 99]))
+    shard = tmp_path / "genes" / "gene_0.pt"
+    shard.parent.mkdir(parents=True)
+    torch.save(broken, shard)
+    (tmp_path / "PreparedDatasetManifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "fabric.backed_prepared_dataset.v1",
+                "input_manifest_id": "boundary-fixture",
+                "compatibility_artifact_id": "boundary-compatible-fixture",
+                "informative_gene_ids": [broken.gene_id],
+                "gene_shards": [
+                    {"gene_id": broken.gene_id, "relative_path": "genes/gene_0.pt"}
+                ],
+            }
+        )
+    )
+    backed = train_module.BackedPreparedDataset.load(tmp_path)
+    with pytest.raises(IndexError, match="first-edge index is out of range"):
+        backed.genes[0]
+
+
+def test_gradient_audit_defers_finiteness_to_the_clip_that_follows():
+    gene = make_toy_genes()[0]
+    config = _one_epoch_config()
+    model = build_paired_models(gene, config["model"], seed=7, device="cpu")["full"]
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    model.readout.output.bias.grad = torch.full_like(
+        model.readout.output.bias, float("nan")
+    )
+
+    # Presence auditing is unaffected; only the duplicate finiteness scan is
+    # deferred, and clip_grad_norm_ is what then fails closed.
+    train_module._assert_finite_gradients(
+        model, require_all=False, require_any=True, check_finite=False
+    )
+    with pytest.raises(RuntimeError, match="non-finite"):
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=1.0, error_if_nonfinite=True
+        )
+    with pytest.raises(FloatingPointError, match="non-finite gradient"):
+        train_module._assert_finite_gradients(
+            model, require_all=False, require_any=True
+        )
+
+    model.zero_grad(set_to_none=True)
+    with pytest.raises(RuntimeError, match="no parameter gradient"):
+        train_module._assert_finite_gradients(
+            model, require_all=False, require_any=True, check_finite=False
+        )
+
+
+def test_disabled_gradient_clip_keeps_the_finiteness_scan(monkeypatch):
+    """With no clip to defer to, the audit must scan gradients itself."""
+
+    seen = []
+    original = train_module._assert_finite_gradients
+
+    def recording(model, **kwargs):
+        seen.append(kwargs.get("check_finite", True))
+        return original(model, **kwargs)
+
+    monkeypatch.setattr(train_module, "_assert_finite_gradients", recording)
+    config = _one_epoch_config()
+    config["optimizer"]["gradient_clip_norm"] = 0.0
+    _train_full(make_toy_genes(), config, seed=101, device="cpu")
+    assert seen and all(seen)
+
+    seen.clear()
+    clipped = _one_epoch_config()
+    clipped["optimizer"]["gradient_clip_norm"] = 1.0
+    _train_full(make_toy_genes(), clipped, seed=101, device="cpu")
+    assert seen and not any(seen)

@@ -30,6 +30,7 @@ from .model import (
     FABRICV2Model,
     GeneCellModelInput,
     RoutedModalityInput,
+    validate_gene_cell_model_input,
 )
 from .source_identity import committed_source_identity
 
@@ -57,6 +58,16 @@ GENE_OBJECTIVES = (
     "reliability_dtu_macro",
 )
 _MODEL_CONDITION = {"full": "full", "atac": "cis_dna", "rbp": "cis_rna"}
+DEFAULT_BACKED_GENE_CACHE_CAPACITY = 2
+
+
+def _backed_gene_cache_capacity(resources: Mapping[str, object]) -> int:
+    value = resources.get(
+        "backed_gene_cache_capacity", DEFAULT_BACKED_GENE_CACHE_CAPACITY
+    )
+    if type(value) is not int or value < 1:
+        raise ValueError("resources.backed_gene_cache_capacity must be positive")
+    return value
 
 
 @dataclass(frozen=True)
@@ -134,9 +145,9 @@ class PreparedDataset:
 class BackedGeneSequence(Sequence[PreparedGene]):
     """One immutable ordered axis of per-gene torch shards.
 
-    The index contains only relative shard paths and gene IDs.  A small LRU
-    avoids repeatedly deserializing the current gene while keeping the
-    17,600-gene dataset out of host RAM.
+    The index contains only relative shard paths and gene IDs.  The configured
+    per-process LRU can either stream a bounded working set or retain the full
+    immutable 17,600-gene axis on a host with sufficient admitted RAM.
     """
 
     def __init__(
@@ -145,6 +156,7 @@ class BackedGeneSequence(Sequence[PreparedGene]):
         records: Sequence[Mapping[str, str]],
         *,
         expected_split_mass: Mapping[str, int] | None = None,
+        cache_capacity: int = DEFAULT_BACKED_GENE_CACHE_CAPACITY,
     ) -> None:
         self.root = Path(root)
         self.records = tuple(
@@ -159,6 +171,25 @@ class BackedGeneSequence(Sequence[PreparedGene]):
         }
         if any(mass <= 0 for mass in self.expected_split_mass.values()):
             raise ValueError("backed expected split mass must be positive")
+        self._cache_capacity = 0
+        self.configure_cache_capacity(cache_capacity)
+
+    @property
+    def cache_capacity(self) -> int:
+        return self._cache_capacity
+
+    def configure_cache_capacity(self, capacity: int) -> None:
+        """Bind the per-process immutable shard residency policy."""
+
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("backed gene cache capacity must be positive")
+        if capacity == self._cache_capacity:
+            return
+        cached_load = getattr(self, "_load", None)
+        if cached_load is not None:
+            cached_load.cache_clear()
+        self._cache_capacity = capacity
+        self._load = lru_cache(maxsize=capacity)(self._load_uncached)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -174,8 +205,7 @@ class BackedGeneSequence(Sequence[PreparedGene]):
             raise IndexError(index)
         return self._load(index)
 
-    @lru_cache(maxsize=2)
-    def _load(self, index: int) -> PreparedGene:
+    def _load_uncached(self, index: int) -> PreparedGene:
         gene_id, relative_path = self.records[index]
         shard = self.root / relative_path
         value = torch.load(shard, map_location="cpu", weights_only=False)
@@ -196,7 +226,12 @@ class BackedPreparedDataset:
     source_git_commit: str | None = None
 
     @classmethod
-    def load(cls, root: str | Path) -> "BackedPreparedDataset":
+    def load(
+        cls,
+        root: str | Path,
+        *,
+        gene_cache_capacity: int = DEFAULT_BACKED_GENE_CACHE_CAPACITY,
+    ) -> "BackedPreparedDataset":
         root = Path(root)
         manifest = json.loads((root / "PreparedDatasetManifest.json").read_text())
         if manifest.get("schema_version") != "fabric.backed_prepared_dataset.v1":
@@ -223,7 +258,10 @@ class BackedPreparedDataset:
                 expected_split_mass[split] = value
         return cls(
             genes=BackedGeneSequence(
-                root, records, expected_split_mass=expected_split_mass
+                root,
+                records,
+                expected_split_mass=expected_split_mass,
+                cache_capacity=gene_cache_capacity,
             ),
             input_manifest_id=str(manifest["input_manifest_id"]),
             compatibility_artifact_id=str(manifest["compatibility_artifact_id"]),
@@ -297,6 +335,7 @@ class TrainingRunManifest:
     gene_weight_dtu_alpha: float | None = None
     gene_weight_table: str | None = None
     lr_scheduler_fixed_initial_epochs: int = 0
+    backed_gene_cache_capacity: int = DEFAULT_BACKED_GENE_CACHE_CAPACITY
 
     def validate(self) -> None:
         if type(self.seed) is not int:
@@ -407,6 +446,11 @@ class TrainingRunManifest:
             raise ValueError("TrainingRunManifest GPU cell cap must be positive")
         if type(self.prefetch_backed_gene_shards) is not bool:
             raise TypeError("TrainingRunManifest prefetch field must be boolean")
+        if (
+            type(self.backed_gene_cache_capacity) is not int
+            or self.backed_gene_cache_capacity < 1
+        ):
+            raise ValueError("TrainingRunManifest backed gene cache must be positive")
         if self.compute_precision != "float32_highest":
             raise ValueError("TrainingRunManifest compute precision differs")
         _validate_train_sampling_manifest(self)
@@ -1994,6 +2038,7 @@ def load_config(path: str | Path) -> dict[str, object]:
         raise ValueError("resources.compute_precision must be float32_highest")
     if type(resources.get("prefetch_backed_gene_shards")) is not bool:
         raise TypeError("resources.prefetch_backed_gene_shards must be boolean")
+    _backed_gene_cache_capacity(resources)
     for name in (
         "target_gpu_allocated_bytes",
         "unmodeled_gpu_reserve_bytes",
@@ -2237,6 +2282,7 @@ def training_manifest_from_config(
         max_cells_per_gpu_batch=int(resources["max_cells_per_gpu_batch"]),
         prefetch_backed_gene_shards=resources["prefetch_backed_gene_shards"],
         compute_precision=str(resources["compute_precision"]),
+        backed_gene_cache_capacity=_backed_gene_cache_capacity(resources),
         gene_objective=gene_objective,
         gene_weight_reliability_tau=(
             float(gene_weighting["reliability_tau"])
@@ -2435,6 +2481,10 @@ def assert_execution_admitted(
         or profile.get("compute_precision") != resources.get("compute_precision")
         or profile.get("prefetch_backed_gene_shards")
         is not resources.get("prefetch_backed_gene_shards")
+        or profile.get(
+            "backed_gene_cache_capacity", DEFAULT_BACKED_GENE_CACHE_CAPACITY
+        )
+        != _backed_gene_cache_capacity(resources)
         or profile.get("target_gpu_allocated_bytes")
         != resources.get("target_gpu_allocated_bytes")
         or profile.get("cuda_allocator_limit_bytes")
@@ -2907,6 +2957,10 @@ def train_run(
     else:
         _validate_prepared_dataset_identity(prepared, config)
         genes = prepared.genes
+    if isinstance(genes, BackedGeneSequence):
+        genes.configure_cache_capacity(
+            _backed_gene_cache_capacity(config["resources"])
+        )
     if config["monitor"]["enabled"] is True and monitor_callback is None:
         target = OntMatrixKlTarget.load(config["monitor"]["target_root"])
         monitor_callback = partial(validation_ont_matrix_kl_monitor, target=target)
@@ -3312,12 +3366,17 @@ def _fit_condition(
                     gene, cell_batch, batch_rows, model
                 )
                 details = compatible_path_nll(
-                    model(batch_input, condition=forward_condition).path_logits,
+                    model.forward_logits(
+                        batch_input,
+                        condition=forward_condition,
+                        prevalidated=True,
+                    ),
                     gene.compatible_path_indices[batch_rows].to(_model_device(model)),
                     gene.compatible_path_mask[batch_rows].to(_model_device(model)),
                     gene.molecule_count[batch_rows].to(_model_device(model)),
                     row_cell_index=row_cell_index,
                     return_details=True,
+                    prevalidated=True,
                 )
                 if gene_objective in {"gene_macro", "reliability_dtu_macro"}:
                     gene_train_mass = gene_train_mass_cache.get(gene.gene_id)
@@ -3362,12 +3421,16 @@ def _fit_condition(
                         * inclusion_multiplier
                         / total_train_mass
                     ).backward()
+            clips_gradients = gradient_clip_norm > 0
             _assert_finite_gradients(
                 model,
                 require_all=False,
                 require_any=True,
+                # The clip below already raises on any non-finite gradient;
+                # skip the duplicate per-parameter scan when it will run.
+                check_finite=not clips_gradients,
             )
-            if gradient_clip_norm > 0:
+            if clips_gradients:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     max_norm=gradient_clip_norm,
@@ -3648,20 +3711,25 @@ def _evaluate_split(
                 batch_input, row_cell_index = _subset_gene_cells(
                     gene, cell_batch, batch_rows, model
                 )
-                output = model(batch_input, condition=condition)
+                path_logits = model.forward_logits(
+                    batch_input,
+                    condition=condition,
+                    prevalidated=True,
+                )
                 details = compatible_path_nll(
-                    output.path_logits,
+                    path_logits,
                     gene.compatible_path_indices[batch_rows].to(_model_device(model)),
                     gene.compatible_path_mask[batch_rows].to(_model_device(model)),
                     gene.molecule_count[batch_rows].to(_model_device(model)),
                     row_cell_index=row_cell_index,
                     return_details=True,
+                    prevalidated=True,
                 )
                 total_weighted += float(details.weighted_sum)
                 total_mass += float(details.molecule_mass)
                 gene_weighted += float(details.weighted_sum)
                 gene_mass += float(details.molecule_mass)
-                path_logits_parts.append(output.path_logits.detach().cpu())
+                path_logits_parts.append(path_logits.detach().cpu())
             path_logits = torch.cat(path_logits_parts, dim=0)
             lookup = torch.full((len(gene.cell_ids),), -1, dtype=torch.long)
             lookup[cells] = torch.arange(cells.numel(), dtype=torch.long)
@@ -3682,6 +3750,8 @@ def _evaluate_split(
                     molecule_count=gene.molecule_count[rows].cpu(),
                 )
             )
+    if not np.isfinite(total_weighted) or not np.isfinite(total_mass):
+        raise FloatingPointError(f"split {split} produced non-finite likelihood terms")
     if total_mass <= 0:
         raise ValueError(f"split {split} has zero likelihood-informative molecule mass")
     return ValidationSnapshot(
@@ -4134,6 +4204,14 @@ def _validate_genes(genes: Sequence[PreparedGene]) -> None:
     for gene in genes:
         if _input_dimensions(gene) != first_dims:
             raise ValueError("prepared genes do not share frozen model feature axes")
+        validate_gene_cell_model_input(
+            gene.model_input,
+            cis_dim=first_dims[0],
+            dna_base_dim=first_dims[1],
+            dna_interaction_dim=first_dims[2],
+            rna_base_dim=first_dims[3],
+            rna_interaction_dim=first_dims[4],
+        )
         row_count = gene.compatible_path_indices.shape[0]
         if (
             gene.compatible_path_mask.shape != gene.compatible_path_indices.shape
@@ -4226,7 +4304,17 @@ def _assert_finite_gradients(
     *,
     require_all: bool,
     require_any: bool = False,
+    check_finite: bool = True,
 ) -> None:
+    """Audit gradient presence, and finiteness unless the caller already does.
+
+    ``check_finite=False`` is only for callers that immediately run
+    ``clip_grad_norm_(..., error_if_nonfinite=True)``: that call computes the
+    total norm over the same parameters and raises on any non-finite entry, so
+    scanning every parameter here first is a duplicate traversal.  Presence
+    checks are pure Python and stay on either way.
+    """
+
     gradient_seen = False
     for name, parameter in model.named_parameters():
         if parameter.grad is None:
@@ -4234,7 +4322,7 @@ def _assert_finite_gradients(
                 raise RuntimeError(f"Full model parameter has no gradient: {name}")
             continue
         gradient_seen = True
-        if not torch.isfinite(parameter.grad).all():
+        if check_finite and not torch.isfinite(parameter.grad).all():
             raise FloatingPointError(
                 f"model parameter has a non-finite gradient: {name}"
             )
@@ -4782,6 +4870,9 @@ def _write_run(
                     "prefetch_backed_gene_shards": config["resources"][
                         "prefetch_backed_gene_shards"
                     ],
+                    "backed_gene_cache_capacity": _backed_gene_cache_capacity(
+                        config["resources"]
+                    ),
                     "target_gpu_allocated_bytes": config["resources"][
                         "target_gpu_allocated_bytes"
                     ],
@@ -5030,7 +5121,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         fixture_path = Path(args.fixture)
         prepared = (
-            BackedPreparedDataset.load(fixture_path)
+            BackedPreparedDataset.load(
+                fixture_path,
+                gene_cache_capacity=_backed_gene_cache_capacity(config["resources"]),
+            )
             if fixture_path.is_dir()
             else torch.load(fixture_path, map_location="cpu", weights_only=False)
         )

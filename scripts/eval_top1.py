@@ -34,6 +34,7 @@ from fabric.model import FABRICV2Model  # noqa: E402
 from fabric.train import (  # noqa: E402
     _MODEL_CONDITION,
     BackedPreparedDataset,
+    _backed_gene_cache_capacity,
     _evaluate_split,
     _model_spec,
     load_config,
@@ -248,7 +249,10 @@ def main() -> int:
         raise SystemExit(f"no checkpoints found under {snapshot_dir}")
 
     print(f"loading prepared dataset from {args.fixture}", flush=True)
-    prepared = BackedPreparedDataset.load(args.fixture)
+    prepared = BackedPreparedDataset.load(
+        args.fixture,
+        gene_cache_capacity=_backed_gene_cache_capacity(config["resources"]),
+    )
     genes = prepared.genes
     device = torch.device(args.device)
     torch.set_float32_matmul_precision("highest")

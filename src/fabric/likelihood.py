@@ -19,7 +19,10 @@ class CompatiblePathNLL:
 
 
 def grouped_log_softmax(
-    path_logits: torch.Tensor, path_gene_index: torch.Tensor | None = None
+    path_logits: torch.Tensor,
+    path_gene_index: torch.Tensor | None = None,
+    *,
+    prevalidated: bool = False,
 ) -> torch.Tensor:
     """Normalize only among legal paths of the same gene."""
 
@@ -29,14 +32,14 @@ def grouped_log_softmax(
         raise ValueError("path_logits must have shape [cells, paths]")
     if not torch.is_floating_point(path_logits):
         raise TypeError("path_logits must use a floating dtype")
-    if not bool(torch.isfinite(path_logits).all().item()):
+    if not prevalidated and not bool(torch.isfinite(path_logits).all().item()):
         raise ValueError("path_logits must be finite")
     if path_gene_index is None:
         return F.log_softmax(path_logits, dim=1)
     path_gene_index = path_gene_index.to(path_logits.device, dtype=torch.long)
     if path_gene_index.ndim != 1 or path_gene_index.numel() != path_logits.shape[1]:
         raise ValueError("path_gene_index must have one entry per path")
-    if bool((path_gene_index < 0).any().item()):
+    if not prevalidated and bool((path_gene_index < 0).any().item()):
         raise ValueError("path_gene_index must be non-negative")
     result = torch.empty_like(path_logits)
     for gene_index in torch.unique(path_gene_index, sorted=True):
@@ -55,12 +58,20 @@ def compatible_path_nll(
     path_gene_index: torch.Tensor | None = None,
     reduction: str = "mean",
     return_details: bool = False,
+    prevalidated: bool = False,
 ) -> torch.Tensor | CompatiblePathNLL:
     """Exact molecule-weighted NLL for compatible legal-path sets.
 
     ``path_logits`` contains one legal-path vector per unique cell.  EC rows
     point to those cells through ``row_cell_index`` and may contain different
     compatible subsets.  Padding is represented only by the explicit mask.
+
+    ``prevalidated`` asserts only that the EC row block already satisfies the
+    frozen shard contract established at ``_validate_genes`` load time (index
+    ranges, left-aligned mask, strictly increasing rows, finite positive
+    molecule counts).  It never disables a guard over values computed here
+    from live model weights: a non-finite row posterior and an empty
+    informative mass still raise on every batch.
     """
 
     if path_logits.ndim == 1:
@@ -76,10 +87,11 @@ def compatible_path_nll(
     molecule_count = molecule_count.to(path_logits.device, dtype=path_logits.dtype)
     if molecule_count.ndim != 1 or molecule_count.numel() != row_count:
         raise ValueError("molecule_count must have one value per EC row")
-    if not bool(torch.isfinite(molecule_count).all().item()):
-        raise ValueError("molecule_count must be finite")
-    if bool((molecule_count < 0).any().item()):
-        raise ValueError("molecule_count must be non-negative")
+    if not prevalidated:
+        if not bool(torch.isfinite(molecule_count).all().item()):
+            raise ValueError("molecule_count must be finite")
+        if bool((molecule_count < 0).any().item()):
+            raise ValueError("molecule_count must be non-negative")
     if row_cell_index is None:
         if path_logits.shape[0] != row_count:
             raise ValueError("row_cell_index is required when cells and EC rows differ")
@@ -88,28 +100,31 @@ def compatible_path_nll(
         row_cell_index = row_cell_index.to(path_logits.device, dtype=torch.long)
     if row_cell_index.ndim != 1 or row_cell_index.numel() != row_count:
         raise ValueError("row_cell_index must have one value per EC row")
-    if bool(
+    if not prevalidated and bool(
         ((row_cell_index < 0) | (row_cell_index >= path_logits.shape[0])).any().item()
     ):
         raise IndexError("row_cell_index is out of range")
     compatible_path_indices = compatible_path_indices.to(
         path_logits.device, dtype=torch.long
     )
-    for row in range(row_count):
-        row_indices = compatible_path_indices[row, compatible_path_mask[row]]
-        if row_indices.numel() == 0:
-            raise ValueError("compatible-path row cannot be empty")
-        if torch.unique(row_indices).numel() != row_indices.numel():
-            raise ValueError("compatible-path row contains duplicate path indices")
-    valid_indices = compatible_path_indices[compatible_path_mask]
-    if valid_indices.numel() == 0:
-        raise ValueError("compatible-path batch contains no non-empty row")
-    if bool(
-        ((valid_indices < 0) | (valid_indices >= path_logits.shape[1])).any().item()
-    ):
-        raise IndexError("compatible path index is out of range")
+    if not prevalidated:
+        for row in range(row_count):
+            row_indices = compatible_path_indices[row, compatible_path_mask[row]]
+            if row_indices.numel() == 0:
+                raise ValueError("compatible-path row cannot be empty")
+            if torch.unique(row_indices).numel() != row_indices.numel():
+                raise ValueError("compatible-path row contains duplicate path indices")
+        valid_indices = compatible_path_indices[compatible_path_mask]
+        if valid_indices.numel() == 0:
+            raise ValueError("compatible-path batch contains no non-empty row")
+        if bool(
+            ((valid_indices < 0) | (valid_indices >= path_logits.shape[1])).any().item()
+        ):
+            raise IndexError("compatible path index is out of range")
 
-    log_probs = grouped_log_softmax(path_logits, path_gene_index)
+    log_probs = grouped_log_softmax(
+        path_logits, path_gene_index, prevalidated=prevalidated
+    )
     padded = torch.where(
         compatible_path_mask,
         compatible_path_indices,
@@ -133,7 +148,7 @@ def compatible_path_nll(
         )
     else:
         path_gene_index = path_gene_index.to(path_logits.device, dtype=torch.long)
-        if bool((path_gene_index < 0).any().item()):
+        if not prevalidated and bool((path_gene_index < 0).any().item()):
             raise ValueError("path_gene_index must be non-negative")
         gene_sizes = torch.bincount(path_gene_index)
         first_valid_column = compatible_path_mask.long().argmax(dim=1)
@@ -145,7 +160,9 @@ def compatible_path_nll(
         selected_genes = torch.where(
             compatible_path_mask, selected_genes, row_gene[:, None]
         )
-        if bool((selected_genes != row_gene[:, None]).any().item()):
+        if not prevalidated and bool(
+            (selected_genes != row_gene[:, None]).any().item()
+        ):
             raise ValueError("one compatible row crosses gene path axes")
         total_paths = gene_sizes[row_gene]
     compatible_sizes = compatible_path_mask.sum(dim=1)

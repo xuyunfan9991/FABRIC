@@ -153,6 +153,7 @@ def test_full_cohort_config_is_single_run_and_test_blind():
     assert manifest.target_gpu_allocated_bytes == 20 << 30
     assert manifest.max_cells_per_gpu_batch == 32_768
     assert manifest.prefetch_backed_gene_shards is True
+    assert manifest.backed_gene_cache_capacity == 2
     assert manifest.compute_precision == "float32_highest"
     assert "max_attention_elements_per_batch" not in config["resources"]
     assert_execution_admitted(config, condition="full")
@@ -260,6 +261,25 @@ def test_condition_profile_binds_model_data_source_and_both_runtime_phases(
     config["resources"]["profile_artifact"] = str(path)
     with pytest.raises(RuntimeError, match="launch boundary|batch structure"):
         assert_execution_admitted(config, condition="full")
+
+
+def test_condition_profile_binds_backed_gene_cache_capacity(tmp_path):
+    config = load_config("configs/fabric_v2_full_cohort.yaml")
+    profile = _as_condition_profile_v1(
+        json.loads(Path(config["resources"]["profile_artifact"]).read_text()),
+        config,
+        condition="full",
+    )
+    config["resources"]["backed_gene_cache_capacity"] = 17_600
+    profile_path = tmp_path / "ResourceProfile.full.cache.json"
+    profile_path.write_text(json.dumps(profile))
+    config["resources"]["profile_artifact"] = str(profile_path)
+    with pytest.raises(RuntimeError, match="launch boundary"):
+        assert_execution_admitted(config, condition="full")
+
+    profile["backed_gene_cache_capacity"] = 17_600
+    profile_path.write_text(json.dumps(profile))
+    assert_execution_admitted(config, condition="full")
 
 
 def test_cuda_allocator_limit_is_validated_and_frozen_in_the_run_manifest(tmp_path):
@@ -410,6 +430,7 @@ def test_shared_gpu_three_arm_configs_freeze_one_scheduler_and_resource_policy(
     assert manifest.target_gpu_allocated_bytes == 6 << 30
     assert manifest.cuda_allocator_limit_bytes == 8 << 30
     assert manifest.max_cells_per_gpu_batch == 4096
+    assert manifest.backed_gene_cache_capacity == 2
     assert config["resources"]["unmodeled_gpu_reserve_bytes"] == 2 << 30
     assert "profile_artifacts" not in config["resources"]
     assert Path(config["resources"]["profile_artifact"]).name == (
@@ -435,6 +456,25 @@ def test_shared_gpu_three_arm_configs_differ_only_by_exact_profile_path():
         config["resources"]["profile_artifact"] = "<condition-specific-profile>"
         configs.append(config)
     assert configs[0] == configs[1] == configs[2]
+
+
+@pytest.mark.parametrize("condition", RUN_CONDITIONS)
+def test_resident_cache_configs_are_explicit_and_not_launch_authorized(condition):
+    config = load_config(
+        "configs/"
+        "fabric_v2_full_cohort_reliability_dtu_macro_shared6g2x_resident_"
+        f"{condition}.yaml"
+    )
+    manifest = training_manifest_from_config(config, seed=1103, condition=condition)
+    assert manifest.backed_gene_cache_capacity == 17_600
+    assert config["resources"]["frozen_host_ram_requirement_bytes"] == 160 << 30
+    assert config["resources"]["frozen"] is False
+    assert config["execution"]["training_authorized"] is False
+    assert Path(config["resources"]["profile_artifact"]).name == (
+        f"ResourceProfile.{condition}.json"
+    )
+    with pytest.raises(RuntimeError, match="not authorized"):
+        assert_execution_admitted(config, condition=condition)
 
 
 def test_condition_profile_cli_refuses_to_overwrite_an_immutable_artifact(tmp_path):
@@ -920,6 +960,137 @@ def test_backed_prepared_dataset_loads_only_requested_gene_shard(tmp_path):
         for index, gene in _iter_gene_order(backed.genes, [1, 0], prefetch=True)
     ]
     assert observed == [(1, genes[1].gene_id), (0, genes[0].gene_id)]
+
+
+def test_configured_backed_gene_cache_keeps_each_shard_resident(
+    tmp_path, monkeypatch
+):
+    first = make_toy_genes()[0]
+    genes = tuple(
+        replace(first, gene_id=f"TOY_RESIDENT_{index}") for index in range(3)
+    )
+    records = []
+    for index, gene in enumerate(genes):
+        relative = f"genes/gene_{index}.pt"
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(gene, destination)
+        records.append({"gene_id": gene.gene_id, "relative_path": relative})
+    (tmp_path / "PreparedDatasetManifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "fabric.backed_prepared_dataset.v1",
+                "input_manifest_id": "resident-fixture",
+                "compatibility_artifact_id": "resident-compatible-fixture",
+                "informative_gene_ids": [gene.gene_id for gene in genes],
+                "gene_shards": records,
+            }
+        )
+    )
+
+    original_load = torch.load
+    shard_loads = []
+
+    def counted_load(path, *args, **kwargs):
+        if Path(path).parent.name == "genes":
+            shard_loads.append(Path(path).name)
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", counted_load)
+    backed = BackedPreparedDataset.load(tmp_path, gene_cache_capacity=len(genes))
+    first_pass = {
+        index: gene
+        for index, gene in _iter_gene_order(
+            backed.genes, [2, 0, 1], prefetch=True
+        )
+    }
+    second_pass = {
+        index: gene
+        for index, gene in _iter_gene_order(
+            backed.genes, [0, 1, 2], prefetch=True
+        )
+    }
+
+    assert sorted(shard_loads) == [f"gene_{index}.pt" for index in range(3)]
+    assert all(second_pass[index] is first_pass[index] for index in range(3))
+    assert backed.genes.cache_capacity == len(genes)
+    assert backed.genes._load.cache_info().currsize == len(genes)
+
+
+def test_backed_gene_cache_capacity_is_a_positive_resource_contract():
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["resources"]["backed_gene_cache_capacity"] = 17_600
+    manifest = training_manifest_from_config(config, seed=101, condition="full")
+    assert manifest.backed_gene_cache_capacity == 17_600
+
+    config["resources"]["backed_gene_cache_capacity"] = 0
+    with pytest.raises(ValueError, match="cache_capacity must be positive"):
+        training_manifest_from_config(config, seed=101, condition="full")
+
+
+def test_train_run_binds_configured_cache_before_first_shard_access(
+    tmp_path, monkeypatch
+):
+    first = make_toy_genes()[0]
+    genes = tuple(replace(first, gene_id=f"TOY_TRAIN_{index}") for index in range(3))
+    records = []
+    for index, gene in enumerate(genes):
+        relative = f"genes/gene_{index}.pt"
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(gene, destination)
+        records.append({"gene_id": gene.gene_id, "relative_path": relative})
+    (tmp_path / "PreparedDatasetManifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "fabric.backed_prepared_dataset.v1",
+                "input_manifest_id": "train-cache-fixture",
+                "compatibility_artifact_id": "train-cache-compatible-fixture",
+                "informative_gene_ids": [gene.gene_id for gene in genes],
+                "gene_shards": records,
+            }
+        )
+    )
+    prepared = BackedPreparedDataset.load(tmp_path)
+    original_load = torch.load
+    shard_loads = []
+
+    def counted_load(path, *args, **kwargs):
+        if Path(path).parent.name == "genes":
+            shard_loads.append(Path(path).name)
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", counted_load)
+    config = load_config("configs/fabric_v2_toy.yaml")
+    config["training"]["max_epochs"] = 1
+    config["training"]["early_stopping_patience"] = 1
+    config["resources"]["backed_gene_cache_capacity"] = len(genes)
+    resident_run = train_run(
+        prepared, config, seed=101, condition="full", device="cpu"
+    )
+
+    assert sorted(shard_loads) == [f"gene_{index}.pt" for index in range(3)]
+    assert prepared.genes.cache_capacity == len(genes)
+    assert prepared.genes._load.cache_info().currsize == len(genes)
+
+    streaming = BackedPreparedDataset.load(tmp_path, gene_cache_capacity=2)
+    streaming_config = deepcopy(config)
+    streaming_config["resources"]["backed_gene_cache_capacity"] = 2
+    streaming_run = train_run(
+        streaming, streaming_config, seed=101, condition="full", device="cpu"
+    )
+    pd.testing.assert_frame_equal(
+        resident_run.result.history,
+        streaming_run.result.history,
+        check_exact=True,
+    )
+    for name, value in resident_run.result.model.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            streaming_run.result.model.state_dict()[name],
+            atol=0,
+            rtol=0,
+        )
 
 
 def test_full_shape_profiler_selects_worst_dynamic_route_batch():

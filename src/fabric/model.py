@@ -113,10 +113,16 @@ class RoutedEventAggregator(nn.Module):
             else None
         )
 
-    def route_projection(self, routed: RoutedModalityInput) -> torch.Tensor:
+    def route_projection(
+        self,
+        routed: RoutedModalityInput,
+        *,
+        prevalidated: bool = False,
+    ) -> torch.Tensor:
         """Return the fixed-route projection before gate and routing weights."""
 
-        _validate_routed_modality(routed, self.base_dim, self.interaction_dim)
+        if not prevalidated:
+            _validate_routed_modality(routed, self.base_dim, self.interaction_dim)
         projected = _bias_free_projection(
             routed.route_base_features, self.base_projection
         )
@@ -133,16 +139,18 @@ class RoutedEventAggregator(nn.Module):
             )
         return projected
 
-    def forward(self, routed: RoutedModalityInput, edge_count: int) -> torch.Tensor:
+    def forward(
+        self,
+        routed: RoutedModalityInput,
+        edge_count: int,
+        *,
+        prevalidated: bool = False,
+    ) -> torch.Tensor:
         if edge_count < 1:
             raise ValueError("event aggregation requires at least one edge token")
-        projected = self.route_projection(routed)
-        if routed.route_edge_index.numel() and bool(
-            ((routed.route_edge_index < 0) | (routed.route_edge_index >= edge_count))
-            .any()
-            .item()
-        ):
-            raise IndexError("route_edge_index is out of range")
+        if not prevalidated:
+            _validate_route_edge_index(routed, edge_count)
+        projected = self.route_projection(routed, prevalidated=prevalidated)
         batch_size = routed.gate.shape[0]
         result = projected.new_zeros((batch_size, edge_count, self.output_dim))
         if projected.shape[0] == 0:
@@ -188,21 +196,24 @@ class GraphGPSBlock(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
-        self, normalized_tokens: torch.Tensor, local_edge_index: torch.Tensor
+        self,
+        normalized_tokens: torch.Tensor,
+        local_edge_index: torch.Tensor,
+        *,
+        prevalidated: bool = False,
     ) -> torch.Tensor:
-        if normalized_tokens.ndim != 3 or normalized_tokens.shape[2] != self.hidden_dim:
-            raise ValueError("GraphGPS tokens must have shape [cells, edges, hidden]")
-        if local_edge_index.ndim != 2 or local_edge_index.shape[0] != 2:
-            raise ValueError("local_edge_index must have shape [2, local edges]")
-        if local_edge_index.dtype != torch.long:
-            raise TypeError("local_edge_index must use torch.long")
+        if not prevalidated:
+            if normalized_tokens.ndim != 3 or normalized_tokens.shape[2] != self.hidden_dim:
+                raise ValueError("GraphGPS tokens must have shape [cells, edges, hidden]")
         batch_size, edge_count, hidden_dim = normalized_tokens.shape
         if batch_size < 1 or edge_count < 1:
             raise ValueError("GraphGPS requires non-empty cell and edge axes")
-        if local_edge_index.numel() and bool(
-            ((local_edge_index < 0) | (local_edge_index >= edge_count)).any().item()
-        ):
-            raise IndexError("local_edge_index is out of range")
+        if not prevalidated:
+            _validate_local_edge_index(
+                local_edge_index,
+                edge_count=edge_count,
+                device=normalized_tokens.device,
+            )
 
         # Each cell receives a disjoint copy of the line graph.  Global
         # attention operates on [B,E,H] directly, so no key/value can cross a
@@ -249,20 +260,26 @@ class PathContextReadout(nn.Module):
         path_first_edge_index: torch.Tensor,
         path_last_edge_index: torch.Tensor,
         log_edge_count: torch.Tensor,
+        *,
+        prevalidated: bool = False,
     ) -> PathReadoutOutput:
-        _validate_path_inputs(
-            edge_states,
-            path_edge_incidence,
-            path_first_edge_index,
-            path_last_edge_index,
-            log_edge_count,
-        )
+        if not prevalidated:
+            _validate_path_inputs(
+                edge_states,
+                path_edge_incidence,
+                path_first_edge_index,
+                path_last_edge_index,
+                log_edge_count,
+            )
         incidence = _coalesced_sparse_matrix(path_edge_incidence).to(
             device=edge_states.device, dtype=edge_states.dtype
         )
-        pooled = torch.stack(
-            [torch.sparse.mm(incidence, states) for states in edge_states], dim=0
+        batch_size, edge_count, hidden_dim = edge_states.shape
+        pooled = torch.sparse.mm(
+            incidence,
+            edge_states.permute(1, 0, 2).reshape(edge_count, batch_size * hidden_dim),
         )
+        pooled = pooled.reshape(-1, batch_size, hidden_dim).permute(1, 0, 2)
         residual = pooled - pooled.mean(dim=1, keepdim=True)
         first = edge_states[:, path_first_edge_index, :]
         last = edge_states[:, path_last_edge_index, :]
@@ -297,21 +314,23 @@ class AdditiveEdgeReadout(nn.Module):
         path_first_edge_index: torch.Tensor,
         path_last_edge_index: torch.Tensor,
         log_edge_count: torch.Tensor,
+        *,
+        prevalidated: bool = False,
     ) -> PathReadoutOutput:
-        _validate_path_inputs(
-            edge_states,
-            path_edge_incidence,
-            path_first_edge_index,
-            path_last_edge_index,
-            log_edge_count,
-        )
+        if not prevalidated:
+            _validate_path_inputs(
+                edge_states,
+                path_edge_incidence,
+                path_first_edge_index,
+                path_last_edge_index,
+                log_edge_count,
+            )
         incidence = _coalesced_sparse_matrix(path_edge_incidence).to(
             device=edge_states.device, dtype=edge_states.dtype
         )
         edge_scores = self.edge_readout(edge_states).squeeze(-1)
-        path_scores = torch.stack(
-            [torch.sparse.mm(incidence, values[:, None]).squeeze(1) for values in edge_scores],
-            dim=0,
+        path_scores = torch.sparse.mm(incidence, edge_scores.transpose(0, 1)).transpose(
+            0, 1
         )
         logits = path_scores + self.beta_len * log_edge_count.to(edge_states)[None, :]
         return PathReadoutOutput(logits=logits)
@@ -360,34 +379,127 @@ class FABRICV2Model(nn.Module):
         else:
             self.readout = AdditiveEdgeReadout(hidden_dim)
 
-    def forward(
-        self, inputs: GeneCellModelInput, *, condition: str = "full"
-    ) -> FABRICOutput:
+    def _compute(
+        self,
+        inputs: GeneCellModelInput,
+        *,
+        condition: str,
+        prevalidated: bool,
+        include_inactive_aggregates: bool,
+    ) -> tuple[
+        PathReadoutOutput,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if condition not in PRIMARY_ABLATIONS:
             raise ValueError(f"unknown primary modality condition: {condition}")
-        _validate_gene_cell_input(inputs, self.cis_dim)
+        if not prevalidated:
+            validate_gene_cell_model_input(
+                inputs,
+                self.cis_dim,
+                dna_base_dim=self.dna_aggregator.base_dim,
+                dna_interaction_dim=self.dna_aggregator.interaction_dim,
+                rna_base_dim=self.rna_aggregator.base_dim,
+                rna_interaction_dim=self.rna_aggregator.interaction_dim,
+            )
         edge_count = inputs.cis_features.shape[0]
-        full_dna = self.dna_aggregator(inputs.dna, edge_count)
-        full_rna = self.rna_aggregator(inputs.rna, edge_count)
         use_dna = condition in {"cis_dna", "full"}
         use_rna = condition in {"cis_rna", "full"}
-        dna = full_dna if use_dna else torch.zeros_like(full_dna)
-        rna = full_rna if use_rna else torch.zeros_like(full_rna)
-        batch_size = full_dna.shape[0]
-        cis = inputs.cis_features.to(full_dna).unsqueeze(0).expand(batch_size, -1, -1)
+        full_dna = (
+            self.dna_aggregator(inputs.dna, edge_count, prevalidated=True)
+            if use_dna or include_inactive_aggregates
+            else None
+        )
+        full_rna = (
+            self.rna_aggregator(inputs.rna, edge_count, prevalidated=True)
+            if use_rna or include_inactive_aggregates
+            else None
+        )
+        batch_size = inputs.dna.gate.shape[0]
+        empty_aggregate = self.joint_projection.weight.new_zeros(
+            (batch_size, edge_count, self.dynamic_dim)
+        )
+        dna = full_dna if use_dna else empty_aggregate
+        rna = full_rna if use_rna else empty_aggregate
+        cis = inputs.cis_features.to(dna).unsqueeze(0).expand(batch_size, -1, -1)
         joint_input = torch.cat((cis, dna, rna), dim=-1)
         joint_projected = self.joint_projection(joint_input)
         normalized = self.pre_layer_norm(joint_projected)
-        edge_states = self.graphgps(normalized, inputs.local_edge_index)
+        edge_states = self.graphgps(
+            normalized, inputs.local_edge_index, prevalidated=True
+        )
         path = self.readout(
             edge_states,
             inputs.path_edge_incidence,
             inputs.path_first_edge_index,
             inputs.path_last_edge_index,
             inputs.log_edge_count,
+            prevalidated=True,
         )
+        # ``prevalidated`` vouches for the immutable gene input contract, not
+        # for values this forward just computed from live weights, so the
+        # non-finite logit guard stays on every batch.
         if not torch.isfinite(path.logits).all():
             raise FloatingPointError("FABRIC produced non-finite path logits")
+        return (
+            path,
+            dna,
+            rna,
+            full_dna,
+            full_rna,
+            joint_input,
+            joint_projected,
+            normalized,
+            edge_states,
+        )
+
+    def forward_logits(
+        self,
+        inputs: GeneCellModelInput,
+        *,
+        condition: str = "full",
+        prevalidated: bool = False,
+    ) -> torch.Tensor:
+        """Return training/evaluation logits without inactive audit channels."""
+
+        return self._compute(
+            inputs,
+            condition=condition,
+            prevalidated=prevalidated,
+            include_inactive_aggregates=False,
+        )[0].logits
+
+    def forward(
+        self,
+        inputs: GeneCellModelInput,
+        *,
+        condition: str = "full",
+        prevalidated: bool = False,
+    ) -> FABRICOutput:
+        (
+            path,
+            dna,
+            rna,
+            full_dna,
+            full_rna,
+            joint_input,
+            joint_projected,
+            normalized,
+            edge_states,
+        ) = self._compute(
+            inputs,
+            condition=condition,
+            prevalidated=prevalidated,
+            include_inactive_aggregates=True,
+        )
+        if full_dna is None or full_rna is None:
+            raise AssertionError("audit forward omitted a full modality aggregate")
         return FABRICOutput(
             path_logits=path.logits,
             dna_aggregate=dna,
@@ -490,6 +602,15 @@ def _validate_routed_modality(
         raise IndexError("event_gate_key_index is out of range")
 
 
+def _validate_route_edge_index(routed: RoutedModalityInput, edge_count: int) -> None:
+    if routed.route_edge_index.numel() and bool(
+        ((routed.route_edge_index < 0) | (routed.route_edge_index >= edge_count))
+        .any()
+        .item()
+    ):
+        raise IndexError("route_edge_index is out of range")
+
+
 def _bias_free_projection(values: torch.Tensor, layer: nn.Linear) -> torch.Tensor:
     """Apply one bias-free projection to dense or sparse route features."""
 
@@ -559,6 +680,71 @@ def _validate_gene_cell_input(inputs: GeneCellModelInput, cis_dim: int) -> None:
         raise ValueError("all model input tensors must share one device")
 
 
+def _validate_local_edge_index(
+    local_edge_index: torch.Tensor,
+    *,
+    edge_count: int,
+    device: torch.device,
+) -> None:
+    if local_edge_index.ndim != 2 or local_edge_index.shape[0] != 2:
+        raise ValueError("local_edge_index must have shape [2, local edges]")
+    if local_edge_index.dtype != torch.long:
+        raise TypeError("local_edge_index must use torch.long")
+    if local_edge_index.device != device:
+        raise ValueError("local_edge_index and edge tensors must share one device")
+    if local_edge_index.numel() and bool(
+        ((local_edge_index < 0) | (local_edge_index >= edge_count)).any().item()
+    ):
+        raise IndexError("local_edge_index is out of range")
+
+
+def validate_gene_cell_model_input(
+    inputs: GeneCellModelInput,
+    cis_dim: int,
+    *,
+    dna_base_dim: int | None = None,
+    dna_interaction_dim: int | None = None,
+    rna_base_dim: int | None = None,
+    rna_interaction_dim: int | None = None,
+) -> None:
+    """Validate one immutable model input before repeated forward execution."""
+
+    _validate_gene_cell_input(inputs, cis_dim)
+    edge_count = int(inputs.cis_features.shape[0])
+    _validate_local_edge_index(
+        inputs.local_edge_index,
+        edge_count=edge_count,
+        device=inputs.cis_features.device,
+    )
+    routed_dimensions = (
+        (inputs.dna, dna_base_dim, dna_interaction_dim),
+        (inputs.rna, rna_base_dim, rna_interaction_dim),
+    )
+    for routed, base_dim, interaction_dim in routed_dimensions:
+        _validate_routed_modality(
+            routed,
+            (
+                int(routed.route_base_features.shape[1])
+                if base_dim is None
+                else int(base_dim)
+            ),
+            (
+                int(routed.route_interaction_features.shape[1])
+                if interaction_dim is None
+                else int(interaction_dim)
+            ),
+        )
+        _validate_route_edge_index(routed, edge_count)
+    _validate_path_catalog(
+        inputs.path_edge_incidence,
+        inputs.path_first_edge_index,
+        inputs.path_last_edge_index,
+        inputs.log_edge_count,
+        edge_count=edge_count,
+        device=inputs.cis_features.device,
+    )
+
+
 def _validate_path_inputs(
     edge_states: torch.Tensor,
     path_edge_incidence: torch.Tensor,
@@ -568,6 +754,25 @@ def _validate_path_inputs(
 ) -> None:
     if edge_states.ndim != 3:
         raise ValueError("edge_states must have shape [cells, edges, hidden]")
+    _validate_path_catalog(
+        path_edge_incidence,
+        first,
+        last,
+        log_edge_count,
+        edge_count=int(edge_states.shape[1]),
+        device=edge_states.device,
+    )
+
+
+def _validate_path_catalog(
+    path_edge_incidence: torch.Tensor,
+    first: torch.Tensor,
+    last: torch.Tensor,
+    log_edge_count: torch.Tensor,
+    *,
+    edge_count: int,
+    device: torch.device,
+) -> None:
     if path_edge_incidence.layout == torch.sparse_coo:
         if path_edge_incidence._nnz() != path_edge_incidence.coalesce()._nnz():
             raise ValueError("path incidence contains duplicate edge entries")
@@ -576,8 +781,8 @@ def _validate_path_inputs(
         if path_edge_incidence._nnz() != sparse_coo.coalesce()._nnz():
             raise ValueError("path incidence contains duplicate edge entries")
     incidence = _coalesced_sparse_matrix(path_edge_incidence)
-    path_count, edge_count = incidence.shape
-    if edge_states.shape[1] != edge_count:
+    path_count, incidence_edge_count = incidence.shape
+    if incidence_edge_count != edge_count:
         raise ValueError("path incidence and edge-state axes differ")
     if path_count < 1:
         raise ValueError("path catalog must be non-empty")
@@ -600,7 +805,7 @@ def _validate_path_inputs(
     if log_edge_count.shape != (path_count,) or not torch.is_floating_point(log_edge_count):
         raise ValueError("log_edge_count must be floating [paths]")
     tensors = (incidence, first, last, log_edge_count)
-    if any(value.device != edge_states.device for value in tensors):
+    if any(value.device != device for value in tensors):
         raise ValueError("path and edge-state tensors must share one device")
     if not torch.isfinite(log_edge_count).all():
         raise ValueError("log_edge_count contains non-finite values")
@@ -640,4 +845,5 @@ __all__ = [
     "PathReadoutOutput",
     "RoutedEventAggregator",
     "RoutedModalityInput",
+    "validate_gene_cell_model_input",
 ]

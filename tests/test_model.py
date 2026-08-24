@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import math
 
@@ -8,6 +9,7 @@ import torch
 
 from fabric.likelihood import compatible_path_nll
 from fabric.model import (
+    AdditiveEdgeReadout,
     PRIMARY_ABLATIONS,
     PathContextReadout,
     RoutedEventAggregator,
@@ -236,6 +238,155 @@ def test_path_centered_residual_sum_has_constitutive_padding_and_jacobian_invari
     )
 
 
+def test_vectorized_path_context_pooling_matches_dense_reference_and_gradients():
+    torch.manual_seed(73)
+    observed_readout = PathContextReadout(hidden_dim=4, path_hidden_dim=6)
+    reference_readout = deepcopy(observed_readout)
+    observed_states = torch.randn(5, 7, 4, requires_grad=True)
+    reference_states = observed_states.detach().clone().requires_grad_()
+    dense_incidence = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    incidence = dense_incidence.to_sparse_coo().coalesce()
+    first = torch.tensor([0, 0, 0])
+    last = torch.tensor([6, 6, 6])
+    log_count = torch.log1p(dense_incidence.sum(dim=1))
+
+    observed = observed_readout(
+        observed_states,
+        incidence,
+        first,
+        last,
+        log_count,
+    )
+    pooled = torch.einsum("pe,beh->bph", dense_incidence, reference_states)
+    residual = pooled - pooled.mean(dim=1, keepdim=True)
+    path_vector = torch.cat(
+        (
+            residual,
+            reference_states[:, first, :],
+            reference_states[:, last, :],
+            log_count.view(1, -1, 1).expand(len(reference_states), -1, -1),
+        ),
+        dim=-1,
+    )
+    reference_logits = reference_readout.output(
+        torch.nn.functional.gelu(reference_readout.hidden(path_vector))
+    ).squeeze(-1)
+
+    torch.testing.assert_close(observed.path_residual, residual)
+    torch.testing.assert_close(observed.path_vector, path_vector)
+    torch.testing.assert_close(observed.logits, reference_logits)
+    observed.logits.square().sum().backward()
+    reference_logits.square().sum().backward()
+    torch.testing.assert_close(observed_states.grad, reference_states.grad)
+    for observed_parameter, reference_parameter in zip(
+        observed_readout.parameters(), reference_readout.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            observed_parameter.grad,
+            reference_parameter.grad,
+        )
+
+
+def test_vectorized_additive_pooling_matches_dense_reference_and_gradients():
+    torch.manual_seed(79)
+    observed_readout = AdditiveEdgeReadout(hidden_dim=4)
+    reference_readout = deepcopy(observed_readout)
+    observed_states = torch.randn(5, 7, 4, requires_grad=True)
+    reference_states = observed_states.detach().clone().requires_grad_()
+    dense_incidence = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    incidence = dense_incidence.to_sparse_coo().coalesce()
+    first = torch.tensor([0, 0, 0])
+    last = torch.tensor([6, 6, 6])
+    log_count = torch.log1p(dense_incidence.sum(dim=1))
+
+    observed = observed_readout(
+        observed_states,
+        incidence,
+        first,
+        last,
+        log_count,
+    ).logits
+    edge_scores = reference_readout.edge_readout(reference_states).squeeze(-1)
+    reference = torch.einsum("pe,be->bp", dense_incidence, edge_scores)
+    reference = reference + reference_readout.beta_len * log_count[None, :]
+
+    torch.testing.assert_close(observed, reference)
+    observed.square().sum().backward()
+    reference.square().sum().backward()
+    torch.testing.assert_close(observed_states.grad, reference_states.grad)
+    for observed_parameter, reference_parameter in zip(
+        observed_readout.parameters(), reference_readout.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            observed_parameter.grad,
+            reference_parameter.grad,
+        )
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected_dna_calls", "expected_rna_calls"),
+    [
+        ("cis", 0, 0),
+        ("cis_dna", 1, 0),
+        ("cis_rna", 0, 1),
+        ("full", 1, 1),
+    ],
+)
+def test_logits_only_forward_skips_inactive_modality_aggregators(
+    condition, expected_dna_calls, expected_rna_calls
+):
+    model, gene = _model_and_gene(seed=83)
+    reference = model(gene.model_input, condition=condition).path_logits
+    calls = {"dna": 0, "rna": 0}
+    dna_handle = model.dna_aggregator.register_forward_hook(
+        lambda *_: calls.__setitem__("dna", calls["dna"] + 1)
+    )
+    rna_handle = model.rna_aggregator.register_forward_hook(
+        lambda *_: calls.__setitem__("rna", calls["rna"] + 1)
+    )
+    observed = model.forward_logits(gene.model_input, condition=condition)
+    dna_handle.remove()
+    rna_handle.remove()
+
+    torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+    assert calls == {
+        "dna": expected_dna_calls,
+        "rna": expected_rna_calls,
+    }
+
+
+def test_prevalidated_logits_path_bypasses_repeated_input_validation(monkeypatch):
+    model, gene = _model_and_gene(seed=89)
+
+    def fail_revalidation(*_args, **_kwargs):
+        raise AssertionError("immutable model input was revalidated")
+
+    monkeypatch.setattr(
+        "fabric.model.validate_gene_cell_model_input",
+        fail_revalidation,
+    )
+    logits = model.forward_logits(
+        gene.model_input,
+        condition="full",
+        prevalidated=True,
+    )
+    assert torch.isfinite(logits).all()
+    with pytest.raises(AssertionError, match="revalidated"):
+        model.forward_logits(gene.model_input, condition="full")
+
+
 @pytest.mark.parametrize(
     ("incidence", "first", "last", "log_count", "message"),
     [
@@ -403,3 +554,13 @@ def test_degree_partition_identity_and_pre_layernorm_scale_control():
         assert torch.isfinite(output.path_logits).all()
     assert norms[-1] > norms[0]
     assert max(normalized_norms) <= math.sqrt(model.hidden_dim) + 1e-5
+
+
+def test_prevalidated_logits_path_still_rejects_non_finite_logits():
+    """Input trust never extends to values this forward just computed."""
+
+    model, gene = _model_and_gene(seed=91)
+    with torch.no_grad():
+        model.readout.output.bias.fill_(float("inf"))
+    with pytest.raises(FloatingPointError, match="non-finite path logits"):
+        model.forward_logits(gene.model_input, condition="full", prevalidated=True)

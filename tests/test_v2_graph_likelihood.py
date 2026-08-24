@@ -199,3 +199,79 @@ def test_likelihood_rejects_nonfinite_logits_before_softmax():
             torch.ones((1, 1), dtype=torch.bool),
             torch.ones(1),
         )
+
+
+def test_prevalidated_likelihood_matches_validated_loss_and_gradient(monkeypatch):
+    validated_logits = torch.tensor(
+        [[0.2, -0.1, 0.7], [0.5, 0.0, -0.3]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    fast_logits = validated_logits.detach().clone().requires_grad_()
+    compatible = torch.tensor([[0, 1], [2, -1], [0, 2]])
+    mask = compatible >= 0
+    counts = torch.tensor([2.0, 3.0, 5.0], dtype=torch.float64)
+    row_cell = torch.tensor([0, 0, 1])
+
+    validated = compatible_path_nll(
+        validated_logits,
+        compatible,
+        mask,
+        counts,
+        row_cell_index=row_cell,
+        return_details=True,
+    )
+
+    def fail_row_unique(*_args, **_kwargs):
+        raise AssertionError("prevalidated EC rows were checked again")
+
+    monkeypatch.setattr(torch, "unique", fail_row_unique)
+    fast = compatible_path_nll(
+        fast_logits,
+        compatible,
+        mask,
+        counts,
+        row_cell_index=row_cell,
+        return_details=True,
+        prevalidated=True,
+    )
+
+    torch.testing.assert_close(fast.loss, validated.loss, atol=0, rtol=0)
+    torch.testing.assert_close(
+        fast.weighted_sum, validated.weighted_sum, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        fast.molecule_mass, validated.molecule_mass, atol=0, rtol=0
+    )
+    fast.loss.backward()
+    validated.loss.backward()
+    torch.testing.assert_close(fast_logits.grad, validated_logits.grad, atol=0, rtol=0)
+
+
+def test_prevalidated_still_guards_values_computed_from_live_weights():
+    """``prevalidated`` vouches for inputs, never for the computed posterior."""
+
+    logits = torch.tensor([[0.2, -0.1, 0.7]], dtype=torch.float64)
+
+    # A row with no compatible path has zero posterior mass.  The row-contract
+    # loop is skipped under prevalidated, so this must be caught downstream.
+    with pytest.raises(ValueError, match="zero posterior mass"):
+        compatible_path_nll(
+            logits,
+            torch.tensor([[0, 1]]),
+            torch.tensor([[False, False]]),
+            torch.tensor([3.0], dtype=torch.float64),
+            row_cell_index=torch.tensor([0]),
+            prevalidated=True,
+        )
+
+    # Every row compatible with the whole path axis leaves no informative mass.
+    with pytest.raises(ValueError, match="zero informative molecule mass"):
+        compatible_path_nll(
+            logits,
+            torch.tensor([[0, 1, 2]]),
+            torch.tensor([[True, True, True]]),
+            torch.tensor([3.0], dtype=torch.float64),
+            row_cell_index=torch.tensor([0]),
+            prevalidated=True,
+        )

@@ -36,6 +36,7 @@ from fabric.model import FABRICV2Model  # noqa: E402
 from fabric.train import (  # noqa: E402
     _MODEL_CONDITION,
     BackedPreparedDataset,
+    _backed_gene_cache_capacity,
     _model_spec,
     _plan_gene_cell_batches,
     _subset_gene_cells,
@@ -71,7 +72,10 @@ def main() -> int:
     threads = torch.get_num_threads()
     config = load_config(args.config)
     training = config["training"]
-    prepared = BackedPreparedDataset.load(args.fixture)
+    prepared = BackedPreparedDataset.load(
+        args.fixture,
+        gene_cache_capacity=_backed_gene_cache_capacity(config["resources"]),
+    )
     genes = prepared.genes
 
     table = pd.read_csv(args.weight_table, sep="\t").sort_values(
@@ -136,12 +140,17 @@ def main() -> int:
                     gene, cell_batch, batch_rows, model
                 )
                 details = compatible_path_nll(
-                    model(batch_input, condition=condition).path_logits,
+                    model.forward_logits(
+                        batch_input,
+                        condition=condition,
+                        prevalidated=True,
+                    ),
                     gene.compatible_path_indices[batch_rows].to(device),
                     gene.compatible_path_mask[batch_rows].to(device),
                     gene.molecule_count[batch_rows].to(device),
                     row_cell_index=row_cell_index,
                     return_details=True,
+                    prevalidated=True,
                 )
                 gene_mass = mass_cache.get(gene.gene_id)
                 if gene_mass is None:

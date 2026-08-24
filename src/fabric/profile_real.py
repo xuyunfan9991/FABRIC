@@ -24,6 +24,7 @@ from .train import (
     PreparedGene,
     RUN_CONDITIONS,
     _MODEL_CONDITION,
+    _backed_gene_cache_capacity,
     _checkpoint_selection_metric,
     _configure_cuda_allocator,
     _estimated_gene_batch_bytes,
@@ -490,9 +491,11 @@ def _profile_gene_phase(
     forward_start = time.perf_counter()
     gradient_context = nullcontext() if is_train else torch.no_grad()
     with gradient_context:
-        path_logits = model(
-            batch_input, condition=_MODEL_CONDITION[condition]
-        ).path_logits
+        path_logits = model.forward_logits(
+            batch_input,
+            condition=_MODEL_CONDITION[condition],
+            prevalidated=True,
+        )
         compatible_path_indices = gene.compatible_path_indices[selected_rows].to(
             torch_device
         )
@@ -507,6 +510,7 @@ def _profile_gene_phase(
             molecule_count,
             row_cell_index=row_cell_index,
             return_details=True,
+            prevalidated=True,
         )
     torch.cuda.synchronize(torch_device)
     forward_seconds = time.perf_counter() - forward_start
@@ -673,6 +677,8 @@ def profile_real_batches(
     manifest = json.loads((prepared_root / "PreparedDatasetManifest.json").read_text())
     records = manifest["gene_record_audit"]
     resources = dict(config["resources"])
+    backed_gene_cache_capacity = _backed_gene_cache_capacity(resources)
+    prepared.genes.configure_cache_capacity(backed_gene_cache_capacity)
     model_config = dict(config["model"])
     dynamic_dim = int(config["model"]["dynamic_projection_dim"])
     training = config["training"]
@@ -884,7 +890,15 @@ def profile_real_batches(
         )
         @ load_coefficients
     ) * load_safety
-    projected_host_load_seconds_per_epoch = 2.0 * host_load_seconds_per_traversal
+    full_shard_residency = backed_gene_cache_capacity >= len(records)
+    projected_first_epoch_host_load_seconds = (
+        host_load_seconds_per_traversal
+        if full_shard_residency
+        else 2.0 * host_load_seconds_per_traversal
+    )
+    projected_steady_state_host_load_seconds_per_epoch = (
+        0.0 if full_shard_residency else 2.0 * host_load_seconds_per_traversal
+    )
     maximum_shard_load_seconds = float(
         np.asarray(
             [1.0, max(all_shard_bytes) / (1 << 30)], dtype=np.float64
@@ -902,23 +916,31 @@ def profile_real_batches(
         projected_train_traversal_seconds = maximum_shard_load_seconds + max(
             train_compute_seconds, remaining_host_load_seconds
         )
-        projected_validation_traversal_seconds = maximum_shard_load_seconds + max(
-            validation_compute_seconds, remaining_host_load_seconds
+        projected_validation_traversal_seconds = (
+            validation_compute_seconds
+            if full_shard_residency
+            else maximum_shard_load_seconds
+            + max(validation_compute_seconds, remaining_host_load_seconds)
         )
     else:
         projected_train_traversal_seconds = (
             train_compute_seconds + host_load_seconds_per_traversal
         )
-        projected_validation_traversal_seconds = (
-            validation_compute_seconds + host_load_seconds_per_traversal
+        projected_validation_traversal_seconds = validation_compute_seconds + (
+            0.0 if full_shard_residency else host_load_seconds_per_traversal
         )
     epoch_seconds = (
         projected_train_traversal_seconds
         + projected_validation_traversal_seconds
     )
+    projected_steady_state_seconds_per_epoch = (
+        train_compute_seconds + validation_compute_seconds
+        if full_shard_residency
+        else epoch_seconds
+    )
     projected_hidden_host_load_seconds_per_epoch = (
         float(projection["projected_compute_seconds_per_epoch"])
-        + projected_host_load_seconds_per_epoch
+        + projected_first_epoch_host_load_seconds
         - epoch_seconds
     )
     # The validation snapshot is the sole complete evaluation object at epoch
@@ -932,13 +954,18 @@ def profile_real_batches(
         for value in records
     )
     maximum_prepared_shard_bytes = max(all_shard_bytes)
+    resident_shard_file_bytes_upper_bound = sum(
+        sorted(all_shard_bytes, reverse=True)[
+            : min(backed_gene_cache_capacity, len(all_shard_bytes))
+        ]
+    )
     profiled_process_peak_rss_bytes = int(
         resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     )
     host_ram_working_upper_bound_bytes = (
         profiled_process_peak_rss_bytes
         + validation_snapshot_tensor_upper_bound_bytes
-        + maximum_prepared_shard_bytes
+        + resident_shard_file_bytes_upper_bound
     )
     frozen_host_ram_requirement_bytes = max(
         32 << 30, 2 * host_ram_working_upper_bound_bytes
@@ -1053,6 +1080,8 @@ def profile_real_batches(
         "batch_policy": resources["batch_policy"],
         "compute_precision": resources["compute_precision"],
         "prefetch_backed_gene_shards": resources["prefetch_backed_gene_shards"],
+        "backed_gene_cache_capacity": backed_gene_cache_capacity,
+        "full_backed_gene_cache_residency": full_shard_residency,
         "target_gpu_allocated_bytes": resources["target_gpu_allocated_bytes"],
         "cuda_allocator_limit_bytes": cuda_allocator_limit_bytes,
         "unmodeled_gpu_reserve_bytes": resources["unmodeled_gpu_reserve_bytes"],
@@ -1119,6 +1148,9 @@ def profile_real_batches(
         },
         "prepared_shard_bytes": sum(all_shard_bytes),
         "maximum_prepared_shard_bytes": maximum_prepared_shard_bytes,
+        "resident_shard_file_bytes_upper_bound": (
+            resident_shard_file_bytes_upper_bound
+        ),
         "validation_snapshot_tensor_upper_bound_bytes": (
             validation_snapshot_tensor_upper_bound_bytes
         ),
@@ -1130,8 +1162,14 @@ def profile_real_batches(
         "projected_initial_shard_load_seconds_per_traversal": (
             maximum_shard_load_seconds
         ),
+        "projected_first_epoch_host_load_seconds": (
+            projected_first_epoch_host_load_seconds
+        ),
         "projected_host_load_seconds_per_epoch": (
-            projected_host_load_seconds_per_epoch
+            projected_first_epoch_host_load_seconds
+        ),
+        "projected_steady_state_host_load_seconds_per_epoch": (
+            projected_steady_state_host_load_seconds_per_epoch
         ),
         "projected_hidden_host_load_seconds_per_epoch": (
             projected_hidden_host_load_seconds_per_epoch
@@ -1144,14 +1182,21 @@ def profile_real_batches(
         ),
         "projected_seconds_per_epoch": epoch_seconds,
         "projected_hours_per_epoch": epoch_seconds / 3_600.0,
+        "projected_steady_state_seconds_per_epoch": (
+            projected_steady_state_seconds_per_epoch
+        ),
+        "projected_steady_state_hours_per_epoch": (
+            projected_steady_state_seconds_per_epoch / 3_600.0
+        ),
         "process_peak_rss_bytes": profiled_process_peak_rss_bytes,
         "projection_semantics": (
             "nonnegative cost models over real workload quantiles and extrema; "
             "each model is inflated to upper-bound every profiled batch plus 15% "
             "headroom, then summed over the per-gene capped training sample, "
-            "one complete validation, and two backed-shard traversals; the next "
-            "immutable CPU shard is prefetched on one worker and traversal wall "
-            "is the maximum of modeled compute and modeled shard load; ONT KL "
+            "one complete validation, and the configured immutable backed-gene "
+            "cache residency; the next uncached CPU shard is prefetched on one "
+            "worker and traversal wall is the maximum of modeled compute and "
+            "modeled shard load; ONT KL "
             "reuses validation logits and is covered by timing "
             "headroom; optimizer-update wall time is not measured because the "
             "prelaunch profile is forbidden to call optimizer.step"
