@@ -1,4 +1,4 @@
-"""Freeze the single full-cohort runtime readiness record."""
+"""Freeze one condition-specific full-cohort runtime readiness record."""
 
 from __future__ import annotations
 
@@ -7,13 +7,36 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shlex
 from typing import Sequence
 
-from .train import FULL_COHORT_SCOPE, load_config
+from .source_identity import committed_source_identity
+from .train import (
+    FULL_COHORT_SCOPE,
+    RUN_CONDITIONS,
+    _MODEL_CONDITION,
+    _assert_condition_profile_batch_structure,
+    _checkpoint_selection_metric,
+    load_config,
+)
 
 
 def _tree_bytes(path: Path) -> int:
     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
+
+
+def _validate_launch_condition(launch_command: str, condition: str) -> None:
+    tokens = shlex.split(launch_command)
+    selected: list[str] = []
+    for index, token in enumerate(tokens):
+        if token == "--condition":
+            if index + 1 == len(tokens):
+                raise ValueError("launch command --condition lacks a value")
+            selected.append(tokens[index + 1])
+        elif token.startswith("--condition="):
+            selected.append(token.partition("=")[2])
+    if selected != [condition]:
+        raise ValueError("launch command must select the readiness condition exactly")
 
 
 def build_readiness_report(
@@ -24,14 +47,23 @@ def build_readiness_report(
     validation_path: str | Path,
     profile_path: str | Path,
     test_report_path: str | Path,
+    condition: str,
     launch_command: str,
 ) -> dict[str, object]:
     root = Path(real_root).resolve()
     compatible = Path(compatible_root).resolve()
     config_path = Path(config_path).resolve()
     config = load_config(config_path)
+    configured_profile = config["resources"].get("profile_artifact")
+    if not isinstance(configured_profile, str) or not Path(configured_profile).is_file():
+        raise ValueError("configured condition resource profile is absent")
+    configured_profile_path = Path(configured_profile).resolve()
+    profile_path = Path(profile_path).resolve()
+    if profile_path != configured_profile_path:
+        raise ValueError("resource profile path differs from the configured condition")
+    _validate_launch_condition(launch_command, condition)
     validation = json.loads(Path(validation_path).read_text())
-    profile = json.loads(Path(profile_path).read_text())
+    profile = json.loads(profile_path.read_text())
     tests = json.loads(Path(test_report_path).read_text())
     prepared = json.loads(
         (root / "prepared_dataset" / "PreparedDatasetManifest.json").read_text()
@@ -48,15 +80,55 @@ def build_readiness_report(
         raise ValueError("real full-shape profile is not frozen in the config")
     if validation.get("status") != "ADMITTED_FOR_PRELAUNCH":
         raise ValueError("strict real-dataset validation is not admitted")
-    if (
-        profile.get("scope") != FULL_COHORT_SCOPE
-        or profile.get("profiled_condition") != "full"
-    ):
+    if profile.get("scope") != FULL_COHORT_SCOPE or profile.get(
+        "profiled_condition"
+    ) != condition:
         raise ValueError("resource profile identity differs")
     training = config["training"]
+    profile_schema = profile.get("schema_version")
+    expected_selection_metric = (
+        "validation_compatible_path_nll"
+        if profile_schema == "fabric.real_full_shape_profile.v3"
+        else _checkpoint_selection_metric(
+            str(training.get("gene_objective", "molecule_weighted"))
+        )
+    )
+    expected_epoch_evaluation_policy = (
+        "one_complete_validation_no_complete_train"
+        if profile_schema == "fabric.real_full_shape_profile.v3"
+        else "projected_complete_train_and_validation_from_profiled_batches"
+    )
     if (
-        profile.get("schema_version") != "fabric.real_full_shape_profile.v3"
+        profile_schema
+        not in {
+            "fabric.real_full_shape_profile.v3",
+            "fabric.real_condition_shape_profile.v1",
+        }
+        or (
+            profile_schema == "fabric.real_full_shape_profile.v3"
+            and condition != "full"
+        )
         or profile.get("status") != "FROZEN_REAL_FULL_SHAPE_PROFILE"
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and profile.get("profiled_model_condition")
+            != _MODEL_CONDITION[condition]
+        )
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and (
+                profile.get("profiled_model_config") != config.get("model")
+                or profile.get("input_manifest_id")
+                != config["inputs"].get("input_manifest_id")
+                or profile.get("compatibility_artifact_id")
+                != config["inputs"].get("compatibility_artifact_id")
+                or profile.get("profile_source_git_commit")
+                != committed_source_identity(require_clean=False)
+            )
+        )
+        or profile.get("gpu_name") != config["resources"].get("gpu_model")
+        or profile.get("gpu_total_memory_bytes")
+        != config["resources"].get("gpu_total_memory_bytes")
         or profile.get("train_sampling_unit") != training["primary_epoch_unit"]
         or profile.get("max_train_gene_cells_per_gene_per_epoch")
         != training["max_train_gene_cells_per_gene_per_epoch"]
@@ -74,6 +146,8 @@ def build_readiness_report(
         is not config["resources"]["prefetch_backed_gene_shards"]
         or profile.get("target_gpu_allocated_bytes")
         != config["resources"]["target_gpu_allocated_bytes"]
+        or profile.get("cuda_allocator_limit_bytes")
+        != config["resources"].get("cuda_allocator_limit_bytes")
         or profile.get("unmodeled_gpu_reserve_bytes")
         != config["resources"]["unmodeled_gpu_reserve_bytes"]
         or profile.get("max_cells_per_gpu_batch")
@@ -84,17 +158,45 @@ def build_readiness_report(
         != config["resources"]["evaluation_bytes_per_shape_element"]
         or profile.get("projected_optimizer_step_count_per_epoch") != 17_600
         or profile.get("epoch_evaluation_policy")
-        != "one_complete_validation_no_complete_train"
+        != expected_epoch_evaluation_policy
+        or (
+            profile_schema == "fabric.real_condition_shape_profile.v1"
+            and profile.get("profile_execution_policy")
+            != "selected_train_backward_and_validation_no_grad_batches"
+        )
         or profile.get("epoch_core_metrics")
         != ["validation_compatible_path_nll", "ont_matrix_kl_count_weighted"]
         or profile.get("checkpoint_selection_metric")
-        != "validation_compatible_path_nll"
+        != expected_selection_metric
         or profile.get("reporting_only_metric") != "ont_matrix_kl_count_weighted"
         or profile.get("ont_validation_target_root") != config["monitor"]["target_root"]
         or profile.get("adaptive_memory_estimate_upper_bounds_all_profiled_batches")
         is not True
+        or (
+            type(profile.get("maximum_profile_peak_gpu_allocated_bytes")) is not int
+            or profile["maximum_profile_peak_gpu_allocated_bytes"]
+            > config["resources"]["target_gpu_allocated_bytes"]
+        )
+        or (
+            type(profile.get("frozen_host_ram_requirement_bytes")) is not int
+            or profile["frozen_host_ram_requirement_bytes"]
+            > config["resources"]["frozen_host_ram_requirement_bytes"]
+        )
+        or (
+            config["resources"].get("cuda_allocator_limit_bytes") is not None
+            and (
+                type(profile.get("maximum_profile_peak_gpu_reserved_bytes")) is not int
+                or profile["maximum_profile_peak_gpu_reserved_bytes"]
+                > config["resources"]["cuda_allocator_limit_bytes"]
+            )
+        )
     ):
         raise ValueError("resource profile train sampling identity differs")
+    if profile_schema == "fabric.real_condition_shape_profile.v1":
+        try:
+            _assert_condition_profile_batch_structure(profile)
+        except RuntimeError as error:
+            raise ValueError("resource profile batch structure differs") from error
     if any(
         profile.get(name) is not False
         for name in (
@@ -106,10 +208,14 @@ def build_readiness_report(
         )
     ):
         raise ValueError("prelaunch profile crossed a forbidden execution boundary")
-    if (
-        tests.get("status") != "PASS"
-        or tests.get("real_full_shape_profile_pass") is not True
-    ):
+    if profile_schema == "fabric.real_full_shape_profile.v3":
+        profile_test_pass = tests.get("real_full_shape_profile_pass") is True
+    else:
+        profile_test_pass = (
+            tests.get("real_condition_shape_profile_v1_pass") is True
+            and tests.get("profiled_conditions") == [condition]
+        )
+    if tests.get("status") != "PASS" or not profile_test_pass:
         raise ValueError("prelaunch test report is not complete")
     if (
         prepared.get("g_fit_gene_count") != 17_600
@@ -129,12 +235,12 @@ def build_readiness_report(
     if not 0 <= rerun_reserve_fraction <= 1:
         raise ValueError("rerun reserve fraction must lie in [0, 1]")
     report = {
-        "schema_version": "fabric.full_cohort_readiness.v1",
+        "schema_version": "fabric.full_cohort_readiness.v2",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "READY_AWAITING_TRAINING_AUTHORIZATION",
         "contract": "FABRIC_ARCHITECTURE_V2",
         "scope": FULL_COHORT_SCOPE,
-        "allowed_conditions": ["full", "atac", "rbp"],
+        "condition": condition,
         "seed": "USER_SELECTED_PER_COMMAND",
         "lambda_base": float(config["optimizer"]["lambda_base"]),
         "lambda_int": float(config["optimizer"]["lambda_int"]),
@@ -143,7 +249,7 @@ def build_readiness_report(
             "learning_rate": float(config["optimizer"]["learning_rate"]),
             "lr_scheduler": dict(config["optimizer"]["lr_scheduler"]),
             "gradient_clip_norm": float(config["optimizer"]["gradient_clip_norm"]),
-            "scheduler_selection_metric": "validation_compatible_path_nll",
+            "scheduler_selection_metric": expected_selection_metric,
             "ont_matrix_kl_controls_scheduler": False,
             "test_controls_scheduler": False,
         },
@@ -153,7 +259,7 @@ def build_readiness_report(
         "cell_count": 217_933,
         "graph_only_gene_count": 106,
         "validation_report": str(Path(validation_path).resolve()),
-        "resource_profile": str(Path(profile_path).resolve()),
+        "resource_profile": str(profile_path),
         "test_report": str(Path(test_report_path).resolve()),
         "config": str(config_path),
         "prepared_dataset": str((root / "prepared_dataset").resolve()),
@@ -176,6 +282,11 @@ def build_readiness_report(
             "compute_precision": profile["compute_precision"],
             "prefetch_backed_gene_shards": profile["prefetch_backed_gene_shards"],
             "target_gpu_allocated_bytes": int(profile["target_gpu_allocated_bytes"]),
+            "cuda_allocator_limit_bytes": (
+                None
+                if profile.get("cuda_allocator_limit_bytes") is None
+                else int(profile["cuda_allocator_limit_bytes"])
+            ),
             "target_gpu_memory_fraction": float(profile["target_gpu_memory_fraction"]),
             "max_cells_per_gpu_batch": int(profile["max_cells_per_gpu_batch"]),
             "train_bytes_per_shape_element": float(
@@ -281,11 +392,11 @@ def _markdown(report: dict[str, object]) -> str:
         )
     return "\n".join(
         [
-            "# FABRIC V2 full-cohort runtime readiness",
+            f"# FABRIC V2 full-cohort {report['condition']} runtime readiness",
             "",
             f"Status: `{report['status']}`",
             "",
-            "- Scope: `full_cohort`; each command independently selects `full`, `atac`, or `rbp` and one integer seed.",
+            f"- Scope: `full_cohort`; this record admits only condition `{report['condition']}` with its exact configured resource profile.",
             "- Universe: 17,600 G_fit genes; 17,706 candidates; 90,672 paths; 217,933 cells; 106 graph-only audit genes.",
             f"- Penalties: lambda_base={report['lambda_base']}, lambda_int={report['lambda_int']}; read directly from the selected config.",
             f"- Optimizer: {optimizer['family']}; learning rate {optimizer['learning_rate']}; scheduler {scheduler_text}; global gradient clip norm {optimizer['gradient_clip_norm']}.",
@@ -324,6 +435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--validation", required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--tests", required=True)
+    parser.add_argument("--condition", choices=RUN_CONDITIONS, required=True)
     parser.add_argument("--launch-command", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
@@ -335,6 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         validation_path=args.validation,
         profile_path=args.profile,
         test_report_path=args.tests,
+        condition=args.condition,
         launch_command=args.launch_command,
     )
     Path(args.output_json).write_text(json.dumps(report, indent=2) + "\n")

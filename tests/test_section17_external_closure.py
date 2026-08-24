@@ -379,6 +379,7 @@ def test_section17_33_command_seed_and_condition_are_exact_and_reproducible():
         gene_microbatch_gradient_accumulation=True,
         batch_policy="gene_shape_adaptive_v1",
         target_gpu_allocated_bytes=67_108_864,
+        cuda_allocator_limit_bytes=None,
         max_cells_per_gpu_batch=32_768,
         prefetch_backed_gene_shards=False,
         compute_precision="float32_highest",

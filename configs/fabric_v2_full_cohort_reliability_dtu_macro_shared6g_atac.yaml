@@ -1,0 +1,92 @@
+contract: FABRIC_ARCHITECTURE_V2
+status: READY_TO_LAUNCH_FULL_COHORT_RUN
+
+execution:
+  scope: full_cohort
+  training_authorized: true
+  final_test_authorized: false
+
+inputs:
+  frozen: true
+  input_manifest_id: fabric_v2_real_dataset_atomic_introns_v1
+  compatibility_artifact_id: fabric_v2_compatible_ec_v1
+  structural_candidate_count: 17706
+  g_fit_gene_count: 17600
+  graph_only_gene_count: 106
+  matrix_structural_path_count: 90672
+  model_isoform_universe: resolved_ont_matrix_structural_paths_only
+  test_exposure: split_identity_only_compatible_rows_absent_no_predictions_or_metrics
+  test_compatible_rows: ABSENT_NOT_MATERIALIZED
+
+model:
+  dynamic_projection_dim: 32
+  hidden_dim: 64
+  attention_heads: 4
+  graphgps_layers: 1
+  path_hidden_dim: 64
+
+optimizer:
+  family: AdamW
+  learning_rate: 5.0e-5
+  lr_scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 2
+    min_lr: 1.0e-5
+  gradient_clip_norm: 1.0
+  lambda_base: 0.001
+  lambda_int: 0.01
+
+training:
+  # B2 variant 3.  The compatible-path NLL and molecule counts inside each
+  # gene are unchanged.  Only the between-gene aggregation changes to
+  # w_g = M_g/(M_g+100) * (1 + alpha*q_g), where q_g is the cohort percentile
+  # of DTU_score and alpha is bounded in [0, 1].
+  gene_objective: reliability_dtu_macro
+  gene_weighting:
+    reliability_tau: 100.0
+    dtu_alpha: 1.0
+    dtu_score_table: /home2/xyf/project/FABRIC/data/processed/fabric_v2_compatible_ec_v1/G_fit.tsv
+  max_epochs: 30
+  early_stopping_patience: 5
+  primary_epoch_unit: sampled_informative_gene_cell_horvitz_thompson
+  max_train_gene_cells_per_gene_per_epoch: 512
+  resample_train_gene_cells_each_epoch: true
+  selected_gene_cell_ec_rows: all_informative_rows
+  sampling_estimator: horvitz_thompson_full_train_molecule_total
+  optimizer_step_unit: train_positive_gene
+  gene_microbatch_gradient_accumulation: true
+
+monitor:
+  enabled: true
+  timing: once_after_each_completed_epoch
+  selection_eligible: false
+  sealed: true
+  metric: ont_matrix_kl_count_weighted
+  scope_policy: likelihood_informative_validation_cell_gene_with_at_least_two_positive_ont_paths
+  target_root: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ont_validation_kl_target
+
+resources:
+  frozen: true
+  profile_status: FROZEN_REAL_FULL_SHAPE_PROFILE
+  validation_status: FROZEN_STRICT_REAL_VALIDATION
+  profile_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_shared6g_resources_v1/ResourceProfile.atac.json
+  validation_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ValidationReport.json
+  batch_policy: gene_shape_adaptive_v1
+  compute_precision: float32_highest
+  prefetch_backed_gene_shards: true
+  target_gpu_allocated_bytes: 6442450944
+  cuda_allocator_limit_bytes: 8589934592
+  unmodeled_gpu_reserve_bytes: 2147483648
+  max_cells_per_gpu_batch: 4096
+  train_bytes_per_shape_element: 12.0
+  evaluation_bytes_per_shape_element: 4.0
+  batching_probability_tolerance: 1.0e-6
+  gpu_count: 1
+  gpu_model: NVIDIA GeForce RTX 4090
+  gpu_total_memory_bytes: 25386352640
+  frozen_host_ram_requirement_bytes: 34359738368
+  rerun_reserve_fraction: 0.10
+
+deferred_cis_extension:
+  enabled: false
