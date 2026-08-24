@@ -1,8 +1,8 @@
 contract: FABRIC_ARCHITECTURE_V2
-status: AWAITING_RESIDENT_CACHE_RESOURCE_PROFILE
+status: READY_TO_LAUNCH_FULL_COHORT_RUN
 execution:
   scope: full_cohort
-  training_authorized: false
+  training_authorized: true
   final_test_authorized: false
 inputs:
   frozen: true
@@ -56,8 +56,8 @@ monitor:
   scope_policy: likelihood_informative_validation_cell_gene_with_at_least_two_positive_ont_paths
   target_root: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ont_validation_kl_target
 resources:
-  frozen: false
-  profile_status: REQUIRES_RESIDENT_CACHE_PROFILE
+  frozen: true
+  profile_status: FROZEN_REAL_FULL_SHAPE_PROFILE
   validation_status: FROZEN_STRICT_REAL_VALIDATION
   profile_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_shared6g2x_resident_resources_v1/ResourceProfile.rbp.json
   validation_artifact: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ValidationReport.json

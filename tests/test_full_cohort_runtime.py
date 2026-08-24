@@ -459,7 +459,13 @@ def test_shared_gpu_three_arm_configs_differ_only_by_exact_profile_path():
 
 
 @pytest.mark.parametrize("condition", RUN_CONDITIONS)
-def test_resident_cache_configs_are_explicit_and_not_launch_authorized(condition):
+def test_resident_cache_configs_are_explicit_and_launch_authorized(condition):
+    """These configs record one authorized resident-cache run per arm.
+
+    Training authorization is deliberate here; held-out test exposure is not,
+    and must stay closed however the training gate moves.
+    """
+
     config = load_config(
         "configs/"
         "fabric_v2_full_cohort_reliability_dtu_macro_shared6g2x_resident_"
@@ -468,13 +474,33 @@ def test_resident_cache_configs_are_explicit_and_not_launch_authorized(condition
     manifest = training_manifest_from_config(config, seed=1103, condition=condition)
     assert manifest.backed_gene_cache_capacity == 17_600
     assert config["resources"]["frozen_host_ram_requirement_bytes"] == 160 << 30
-    assert config["resources"]["frozen"] is False
-    assert config["execution"]["training_authorized"] is False
+    assert config["resources"]["frozen"] is True
+    assert config["resources"]["profile_status"] == "FROZEN_REAL_FULL_SHAPE_PROFILE"
+    assert config["execution"]["training_authorized"] is True
+    assert config["execution"]["final_test_authorized"] is False
     assert Path(config["resources"]["profile_artifact"]).name == (
         f"ResourceProfile.{condition}.json"
     )
+
+
+@pytest.mark.parametrize("condition", RUN_CONDITIONS)
+def test_resident_cache_configs_fail_closed_without_their_frozen_profile(condition):
+    """The authorized config is admitted only by its own regenerated profile."""
+
+    config = load_config(
+        "configs/"
+        "fabric_v2_full_cohort_reliability_dtu_macro_shared6g2x_resident_"
+        f"{condition}.yaml"
+    )
+    revoked = deepcopy(config)
+    revoked["execution"]["training_authorized"] = False
     with pytest.raises(RuntimeError, match="not authorized"):
-        assert_execution_admitted(config, condition=condition)
+        assert_execution_admitted(revoked, condition=condition)
+
+    streaming = deepcopy(config)
+    streaming["resources"]["backed_gene_cache_capacity"] = 2
+    with pytest.raises(RuntimeError, match="launch boundary"):
+        assert_execution_admitted(streaming, condition=condition)
 
 
 def test_condition_profile_cli_refuses_to_overwrite_an_immutable_artifact(tmp_path):
