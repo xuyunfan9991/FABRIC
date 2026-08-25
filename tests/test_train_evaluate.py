@@ -1056,6 +1056,131 @@ def test_completed_epoch_resume_exactly_matches_uninterrupted_training(
     assert (interrupted_dir / "checkpoint.pt").is_file()
 
 
+def test_max_epoch_continuation_exactly_matches_uninterrupted_training(tmp_path):
+    parent_config = load_config("configs/fabric_v2_toy.yaml")
+    parent_config["training"]["max_epochs"] = 2
+    parent_config["training"]["early_stopping_patience"] = 2
+    parent_config["optimizer"]["learning_rate"] = 0.01
+    parent_config["optimizer"]["lr_scheduler"] = {
+        "name": "reduce_on_plateau",
+        "factor": 0.5,
+        "patience": 0,
+        "min_lr": 0.001,
+    }
+    continuation_config = copy.deepcopy(parent_config)
+    continuation_config["training"]["max_epochs"] = 4
+    first = make_toy_genes(seed=29)[0]
+    genes = [first, replace(first, gene_id="TOY_GENE_2")]
+
+    parent_dir = tmp_path / "parent"
+    parent = train_run(
+        genes,
+        parent_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=parent_dir,
+    )
+    assert parent.result.history["epoch"].tolist() == [1, 2]
+    assert torch.load(
+        parent_dir / "latest.pt", map_location="cpu", weights_only=False
+    )["training_complete"]
+
+    continuation_dir = tmp_path / "continuation"
+    continued = train_run(
+        genes,
+        continuation_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=continuation_dir,
+        continue_from=parent_dir / "latest.pt",
+    )
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    uninterrupted = train_run(
+        genes,
+        continuation_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=uninterrupted_dir,
+    )
+
+    pd.testing.assert_frame_equal(
+        continued.result.history, uninterrupted.result.history, check_exact=True
+    )
+    assert continued.result.best_epoch == uninterrupted.result.best_epoch
+    assert continued.result.best_validation_nll == (
+        uninterrupted.result.best_validation_nll
+    )
+    continued_latest = torch.load(
+        continuation_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    uninterrupted_latest = torch.load(
+        uninterrupted_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    for state_name in (
+        "completed_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "lr_scheduler_state_dict",
+        "best_epoch",
+        "best_validation_nll",
+        "best_model_state_dict",
+        "best_optimizer_state_dict",
+        "best_lr_scheduler_state_dict",
+        "epochs_without_improvement",
+        "history_rows",
+        "monitor_records",
+        "gene_order_rng_state",
+        "global_rng_state",
+        "training_complete",
+        "held_out_test_evaluated",
+    ):
+        _assert_nested_equal(
+            continued_latest[state_name], uninterrupted_latest[state_name]
+        )
+    assert sorted(
+        path.name for path in (continuation_dir / "epoch_checkpoints").glob("*.pt")
+    ) == ["epoch_3.pt", "epoch_4.pt"]
+    lineage = json.loads(
+        (continuation_dir / "continuation_manifest.json").read_text()
+    )
+    assert lineage["parent_completed_epoch"] == 2
+    assert lineage["continuation_first_epoch"] == 3
+    assert lineage["continuation_max_epochs"] == 4
+    assert lineage["held_out_test_evaluated"] is False
+
+
+def test_max_epoch_continuation_rejects_any_other_config_change(tmp_path):
+    parent_config = load_config("configs/fabric_v2_toy.yaml")
+    parent_config["training"]["max_epochs"] = 1
+    parent_config["training"]["early_stopping_patience"] = 1
+    genes = make_toy_genes(seed=41)
+    parent_dir = tmp_path / "parent"
+    train_run(
+        genes,
+        parent_config,
+        seed=42,
+        condition="atac",
+        device="cpu",
+        run_dir=parent_dir,
+    )
+    changed = copy.deepcopy(parent_config)
+    changed["training"]["max_epochs"] = 3
+    changed["optimizer"]["learning_rate"] = 0.002
+    with pytest.raises(ValueError, match="differs beyond"):
+        train_run(
+            genes,
+            changed,
+            seed=42,
+            condition="atac",
+            device="cpu",
+            run_dir=tmp_path / "rejected_continuation",
+            continue_from=parent_dir / "latest.pt",
+        )
+
+
 def test_per_epoch_checkpoints_saved_natively(tmp_path):
     config = load_config("configs/fabric_v2_toy.yaml")
     config["training"]["max_epochs"] = 3

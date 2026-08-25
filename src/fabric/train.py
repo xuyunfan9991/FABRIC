@@ -2944,8 +2944,9 @@ def train_run(
     run_dir: str | Path | None = None,
     monitor_callback: EpochMonitor | None = None,
     resume_from: str | Path | None = None,
+    continue_from: str | Path | None = None,
 ) -> TrainingRunResult:
-    """Train one seed/condition, optionally resuming after a completed epoch."""
+    """Train one seed/condition, optionally recovering or extending a run."""
 
     manifest = training_manifest_from_config(config, seed=seed, condition=condition)
     assert_execution_admitted(config, condition=condition)
@@ -3004,10 +3005,13 @@ def train_run(
             raise RuntimeError(
                 "runtime GPU lacks the frozen adaptive-batch and allocator allowance"
             )
-    if resume_from is not None and run_dir is None:
-        raise ValueError("resume_from requires the original run_dir")
+    if resume_from is not None and continue_from is not None:
+        raise ValueError("resume_from and continue_from are mutually exclusive")
+    if (resume_from is not None or continue_from is not None) and run_dir is None:
+        raise ValueError("training recovery requires an explicit run_dir")
     run_path = Path(run_dir) if run_dir is not None else None
     resume_path = Path(resume_from) if resume_from is not None else None
+    continuation_path = Path(continue_from) if continue_from is not None else None
     if run_path is not None:
         if resume_path is None:
             run_path.mkdir(parents=True, exist_ok=False)
@@ -3030,8 +3034,31 @@ def train_run(
             prepared=prepared,
         )
         resume_checkpoint: Mapping[str, object] | None = None
+        resume_checkpoint_max_epochs: int | None = None
+        resume_validated_callback: EpochCheckpoint | None = None
         if run_path is not None:
-            if resume_path is None:
+            if continuation_path is not None:
+                (
+                    resume_checkpoint,
+                    resume_checkpoint_max_epochs,
+                    continuation_lineage,
+                ) = _load_max_epoch_continuation_parent(
+                    continuation_path,
+                    current_manifest=manifest,
+                    current_config=config,
+                    genes=genes,
+                    prepared=prepared,
+                    continuation_run_dir=run_path,
+                )
+                resume_validated_callback = partial(
+                    _initialize_continuation_run,
+                    run_dir=run_path,
+                    manifest=manifest,
+                    config=config,
+                    recovery_identity=recovery_identity,
+                    continuation_lineage=continuation_lineage,
+                )
+            elif resume_path is None:
                 _write_initial_run_identity(run_path, manifest, config)
             else:
                 expected_latest = run_path / "latest.pt"
@@ -3043,6 +3070,9 @@ def train_run(
                 _validate_stored_run_identity(run_path, manifest, config)
                 resume_checkpoint = _load_training_recovery_checkpoint(
                     resume_path, expected_identity=recovery_identity
+                )
+                resume_validated_callback = partial(
+                    _reconcile_recovery_artifacts, run_path
                 )
 
         checkpoint_callback = (
@@ -3064,12 +3094,9 @@ def train_run(
             monitor_callback=monitor_callback,
             objective_weighting=objective_weighting,
             resume_checkpoint=resume_checkpoint,
+            resume_checkpoint_max_epochs=resume_checkpoint_max_epochs,
             epoch_checkpoint_callback=checkpoint_callback,
-            resume_validated_callback=(
-                None
-                if run_path is None
-                else partial(_reconcile_recovery_artifacts, run_path)
-            ),
+            resume_validated_callback=resume_validated_callback,
         )
         best_history_row = result.history.loc[
             result.history["epoch"] == result.best_epoch
@@ -3204,6 +3231,7 @@ def _fit_condition(
     monitor_callback: EpochMonitor | None,
     objective_weighting: GeneObjectiveWeighting | None = None,
     resume_checkpoint: Mapping[str, object] | None = None,
+    resume_checkpoint_max_epochs: int | None = None,
     epoch_checkpoint_callback: EpochCheckpoint | None = None,
     resume_validated_callback: EpochCheckpoint | None = None,
 ) -> ConditionResult:
@@ -3274,6 +3302,7 @@ def _fit_condition(
             seed=seed,
             condition_name=condition_name,
             max_epochs=max_epochs,
+            checkpoint_max_epochs=resume_checkpoint_max_epochs,
             patience=patience,
             monitor_enabled=monitor_callback is not None,
             selection_metric=selection_metric_name,
@@ -4444,6 +4473,7 @@ def _training_recovery_identity(
     config: Mapping[str, object],
     genes: Sequence[PreparedGene],
     prepared: PreparedDataset | BackedPreparedDataset | None,
+    source_git_commit: str | None = None,
 ) -> dict[str, object]:
     if isinstance(genes, BackedGeneSequence):
         ordered_gene_ids = tuple(gene_id for gene_id, _ in genes.records)
@@ -4451,9 +4481,13 @@ def _training_recovery_identity(
     else:
         ordered_gene_ids = tuple(gene.gene_id for gene in genes)
         dataset_kind = "prepared_dataset" if prepared is not None else "sequence"
-    source_commit = _runtime_source_commit(
-        require_clean=config["execution"]["scope"] == FULL_COHORT_SCOPE
-    )
+    source_commit = source_git_commit
+    if source_commit is None:
+        source_commit = _runtime_source_commit(
+            require_clean=config["execution"]["scope"] == FULL_COHORT_SCOPE
+        )
+    elif not isinstance(source_commit, str) or not source_commit:
+        raise ValueError("recovery source commit must be a nonempty string")
     # The artifact's build commit and the training-source commit are both
     # recorded below, but equality is no longer enforced (user decision,
     # 2026-08-18): a training-side src/fabric change would otherwise force a
@@ -4520,6 +4554,136 @@ def _validate_stored_run_identity(
         raise ValueError("resume training manifest differs from the original run")
 
 
+def _load_stored_run_identity(
+    run_dir: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    config_path = run_dir / "config.yaml"
+    manifest_path = run_dir / "training_run_manifest.json"
+    if not config_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(
+            "continuation parent lacks config.yaml or training_run_manifest.json"
+        )
+    stored_config = load_config(config_path)
+    stored_manifest = json.loads(manifest_path.read_text())
+    if not isinstance(stored_manifest, dict):
+        raise TypeError("continuation parent training manifest must be a mapping")
+    return stored_config, stored_manifest
+
+
+def _continuation_parent_source_commit(
+    parent_config: Mapping[str, object],
+) -> str:
+    if parent_config["execution"]["scope"] != FULL_COHORT_SCOPE:
+        return _runtime_source_commit(require_clean=False)
+    profile_path = Path(parent_config["resources"]["profile_artifact"])
+    if not profile_path.is_file():
+        raise FileNotFoundError("continuation parent resource profile is absent")
+    profile = json.loads(profile_path.read_text())
+    source_commit = profile.get("profile_source_git_commit")
+    if not isinstance(source_commit, str) or not source_commit:
+        raise ValueError("continuation parent profile lacks its source commit")
+    return source_commit
+
+
+def _validate_max_epoch_continuation_config(
+    parent_config: Mapping[str, object],
+    current_config: Mapping[str, object],
+) -> tuple[int, int]:
+    parent_max_epochs = int(parent_config["training"]["max_epochs"])
+    current_max_epochs = int(current_config["training"]["max_epochs"])
+    if current_max_epochs <= parent_max_epochs:
+        raise ValueError(
+            "continuation max_epochs must be greater than the parent safety cap"
+        )
+    expected = copy.deepcopy(dict(parent_config))
+    expected["training"]["max_epochs"] = current_max_epochs
+    current_profile = current_config["resources"].get("profile_artifact")
+    if current_profile is not None or "profile_artifact" in expected["resources"]:
+        expected["resources"]["profile_artifact"] = current_profile
+    if expected != dict(current_config):
+        raise ValueError(
+            "continuation config differs beyond training.max_epochs and the "
+            "source-matched resources.profile_artifact"
+        )
+    if (
+        parent_config["execution"].get("final_test_authorized") is not False
+        or current_config["execution"].get("final_test_authorized") is not False
+    ):
+        raise RuntimeError("training continuation must keep held-out test closed")
+    return parent_max_epochs, current_max_epochs
+
+
+def _load_max_epoch_continuation_parent(
+    path: Path,
+    *,
+    current_manifest: TrainingRunManifest,
+    current_config: Mapping[str, object],
+    genes: Sequence[PreparedGene],
+    prepared: PreparedDataset | BackedPreparedDataset | None,
+    continuation_run_dir: Path,
+) -> tuple[Mapping[str, object], int, dict[str, object]]:
+    parent_run_dir = path.parent
+    expected_latest = parent_run_dir / "latest.pt"
+    if path.resolve() != expected_latest.resolve():
+        raise ValueError(
+            "continue_from must be a parent run_dir/latest.pt; best checkpoints "
+            "cannot extend an epoch history"
+        )
+    if continuation_run_dir.resolve() == parent_run_dir.resolve():
+        raise ValueError("continuation requires a new append-only run directory")
+    parent_config, stored_parent_manifest = _load_stored_run_identity(parent_run_dir)
+    parent_manifest = training_manifest_from_config(
+        parent_config,
+        seed=current_manifest.seed,
+        condition=current_manifest.condition,
+    )
+    if stored_parent_manifest != asdict(parent_manifest):
+        raise ValueError("continuation parent training manifest differs from config")
+    parent_max_epochs, current_max_epochs = _validate_max_epoch_continuation_config(
+        parent_config, current_config
+    )
+    parent_source_commit = _continuation_parent_source_commit(parent_config)
+    parent_identity = _training_recovery_identity(
+        manifest=parent_manifest,
+        config=parent_config,
+        genes=genes,
+        prepared=prepared,
+        source_git_commit=parent_source_commit,
+    )
+    checkpoint = _load_training_recovery_checkpoint(
+        path, expected_identity=parent_identity
+    )
+    if checkpoint["completed_epoch"] != parent_max_epochs:
+        raise ValueError(
+            "continuation parent must have stopped exactly at its max-epoch cap"
+        )
+    if checkpoint["training_complete"] is not True:
+        raise ValueError("continuation parent max-epoch checkpoint is not terminal")
+    if checkpoint["epochs_without_improvement"] >= int(
+        current_config["training"]["early_stopping_patience"]
+    ):
+        raise ValueError("continuation parent already reached early stopping")
+    lineage = {
+        "schema_version": "fabric.max_epoch_continuation.v1",
+        "parent_run_dir": str(parent_run_dir.resolve()),
+        "parent_latest_checkpoint": str(path.resolve()),
+        "parent_completed_epoch": parent_max_epochs,
+        "continuation_first_epoch": parent_max_epochs + 1,
+        "parent_max_epochs": parent_max_epochs,
+        "continuation_max_epochs": current_max_epochs,
+        "parent_source_git_commit": parent_source_commit,
+        "continuation_source_git_commit": _runtime_source_commit(
+            require_clean=current_config["execution"]["scope"] == FULL_COHORT_SCOPE
+        ),
+        "allowed_config_changes": [
+            "training.max_epochs",
+            "resources.profile_artifact",
+        ],
+        "held_out_test_evaluated": False,
+    }
+    return checkpoint, parent_max_epochs, lineage
+
+
 def _load_training_recovery_checkpoint(
     path: Path,
     *,
@@ -4576,6 +4740,7 @@ def _restore_fit_checkpoint(
     seed: int,
     condition_name: str,
     max_epochs: int,
+    checkpoint_max_epochs: int | None = None,
     patience: int,
     monitor_enabled: bool,
     selection_metric: str = "validation_compatible_path_nll",
@@ -4589,11 +4754,15 @@ def _restore_fit_checkpoint(
             f"stored={stored_metric!r} expected={selection_metric!r}"
         )
     completed_epoch = checkpoint["completed_epoch"]
+    terminal_max_epochs = (
+        max_epochs if checkpoint_max_epochs is None else checkpoint_max_epochs
+    )
     best_epoch = checkpoint["best_epoch"]
     epochs_without_improvement = checkpoint["epochs_without_improvement"]
     if (
         type(completed_epoch) is not int
         or not 1 <= completed_epoch <= max_epochs
+        or not 1 <= completed_epoch <= terminal_max_epochs
         or type(best_epoch) is not int
         or not 1 <= best_epoch <= completed_epoch
         or type(epochs_without_improvement) is not int
@@ -4670,7 +4839,8 @@ def _restore_fit_checkpoint(
         raise ValueError("resume contains ONT monitor values while monitoring is disabled")
 
     expected_training_complete = (
-        completed_epoch >= max_epochs or epochs_without_improvement >= patience
+        completed_epoch >= terminal_max_epochs
+        or epochs_without_improvement >= patience
     )
     if checkpoint["training_complete"] is not expected_training_complete:
         raise ValueError("resume terminal state differs from epoch controls")
@@ -4790,8 +4960,47 @@ def _reconcile_recovery_artifacts(
     _atomic_torch_save(_best_checkpoint_from_recovery(checkpoint), run_dir / "best.pt")
     # Heal the crash window between the latest.pt commit and the epoch
     # snapshot: the validated resume checkpoint is that epoch's state.
-    _snapshot_completed_epoch(run_dir, checkpoint, backfill=True)
+    lineage = checkpoint.get("continuation_lineage")
+    is_continuation_boundary = (
+        isinstance(lineage, Mapping)
+        and checkpoint["completed_epoch"] == lineage.get("parent_completed_epoch")
+    )
+    if not is_continuation_boundary:
+        _snapshot_completed_epoch(run_dir, checkpoint, backfill=True)
     _write_recovery_history(run_dir, checkpoint)
+
+
+def _initialize_continuation_run(
+    checkpoint: Mapping[str, object],
+    *,
+    run_dir: Path,
+    manifest: TrainingRunManifest,
+    config: Mapping[str, object],
+    recovery_identity: Mapping[str, object],
+    continuation_lineage: Mapping[str, object],
+) -> None:
+    if any(
+        (run_dir / name).exists()
+        for name in (
+            "config.yaml",
+            "training_run_manifest.json",
+            "continuation_manifest.json",
+            "latest.pt",
+        )
+    ):
+        raise FileExistsError("continuation run identity already exists")
+    _write_initial_run_identity(run_dir, manifest, config)
+    _atomic_write_text(
+        run_dir / "continuation_manifest.json",
+        json.dumps(dict(continuation_lineage), indent=2, sort_keys=True),
+    )
+    boundary = copy.deepcopy(dict(checkpoint))
+    boundary["run_identity"] = copy.deepcopy(dict(recovery_identity))
+    boundary["training_complete"] = False
+    boundary["continuation_lineage"] = copy.deepcopy(dict(continuation_lineage))
+    _atomic_torch_save(boundary, run_dir / "latest.pt")
+    _atomic_torch_save(_best_checkpoint_from_recovery(boundary), run_dir / "best.pt")
+    _write_recovery_history(run_dir, boundary)
 
 
 def _persist_epoch_recovery(
@@ -5068,11 +5277,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train the single FABRIC V2 runtime")
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", required=True)
-    parser.add_argument(
+    recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument(
         "--resume-from",
         help=(
             "resume the same run from its atomic latest.pt after the most recent "
             "completed epoch"
+        ),
+    )
+    recovery.add_argument(
+        "--continue-from",
+        help=(
+            "extend a parent run that ended at its max-epoch cap into this new "
+            "append-only run directory"
         ),
     )
     parser.add_argument("--device", default="cpu")
@@ -5141,6 +5358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         run_dir=args.run_dir,
         resume_from=args.resume_from,
+        continue_from=args.continue_from,
     )
     return 0
 

@@ -484,6 +484,28 @@ def test_resident_cache_configs_are_explicit_and_launch_authorized(condition):
 
 
 @pytest.mark.parametrize("condition", RUN_CONDITIONS)
+def test_continue100_configs_change_only_the_cap_and_source_matched_profile(
+    condition,
+):
+    prefix = (
+        "configs/"
+        "fabric_v2_full_cohort_reliability_dtu_macro_shared6g2x_resident_"
+    )
+    parent = load_config(f"{prefix}{condition}.yaml")
+    continuation = load_config(f"{prefix}continue100_{condition}.yaml")
+    assert parent["training"]["max_epochs"] == 30
+    assert continuation["training"]["max_epochs"] == 100
+    assert continuation["training"]["early_stopping_patience"] == 5
+    assert continuation["execution"]["training_authorized"] is True
+    assert continuation["execution"]["final_test_authorized"] is False
+    parent["training"]["max_epochs"] = 100
+    parent["resources"]["profile_artifact"] = continuation["resources"][
+        "profile_artifact"
+    ]
+    assert parent == continuation
+
+
+@pytest.mark.parametrize("condition", RUN_CONDITIONS)
 def test_resident_cache_configs_fail_closed_without_their_frozen_profile(condition):
     """The authorized config is admitted only by its own regenerated profile."""
 
