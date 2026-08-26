@@ -57,12 +57,12 @@ print("preflight OK: Full e53 patience stop -> e75 cap, held-out test closed")
 EOF
 
 tmux new-session -d -s "$SESSION" -c "$PWD" \
-    "taskset -c 0-15 env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=$PWD/src \
+    "taskset -c 64-79 env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=$PWD/src \
      $PY -m fabric.train \
      --config $CONFIG \
      --fixture $FIXTURE \
      --run-dir $RUN \
      --continue-from $PARENT/latest.pt \
-     --condition full --seed $SEED --device cuda:0 \
+     --condition full --seed $SEED --device cuda:1 \
      2>&1 | tee ${RUN}.log"
-echo "launched Full: epoch 53 -> cap 75, patience disabled, GPU 0, cores 0-15, tmux $SESSION"
+echo "launched Full: epoch 53 -> cap 75, patience disabled, GPU 1, cores 64-79, tmux $SESSION"
