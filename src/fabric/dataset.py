@@ -3263,54 +3263,6 @@ def build_ont_observation_process_audit(
     )
 
 
-def audit_high_dtu_provenance(
-    gene_metadata: pd.DataFrame,
-    *,
-    sensitivity_enabled: bool,
-    selection_config: Mapping[str, object],
-) -> dict[str, object]:
-    """Freeze a train-side-only high-DTU sensitivity provenance record."""
-
-    required = {
-        "target_gene_id",
-        "metadata_split_scope",
-        "high_dtu_gene",
-        "dtu_source_identity",
-    }
-    _require_columns(gene_metadata, required, "high-DTU provenance metadata")
-    if gene_metadata["target_gene_id"].astype(str).duplicated().any():
-        raise ValueError("high-DTU provenance requires unique gene IDs")
-    scopes = set(gene_metadata["metadata_split_scope"].astype(str))
-    if scopes != {"train_only"}:
-        raise ValueError("high-DTU selection metadata must be derived only from train scope")
-    if gene_metadata["dtu_source_identity"].isna().any():
-        raise ValueError("high-DTU source identity must be complete")
-    enabled = bool(sensitivity_enabled)
-    manifest = {
-        "schema_version": "FABRIC_V2_HIGH_DTU_PROVENANCE_V1",
-        "sensitivity_enabled": enabled,
-        "selection_config": dict(selection_config),
-        "metadata_split_scope": "train_only",
-        "gene_count": len(gene_metadata),
-        "high_dtu_gene_count": int(gene_metadata["high_dtu_gene"].astype(bool).sum()),
-        "dtu_source_identities": sorted(
-            set(gene_metadata["dtu_source_identity"].astype(str))
-        ),
-        "primary_sampling_or_loss_effect": "none",
-        "formal_claim_scope": "sensitivity_only" if enabled else "disabled_zero_effect",
-    }
-    if not enabled and any(
-        float(selection_config.get(key, default)) != default
-        for key, default in (
-            ("high_dtu_sampling_multiplier", 1.0),
-            ("high_dtu_loss_multiplier", 1.0),
-        )
-    ):
-        raise ValueError("disabled high-DTU sensitivity must have zero sampling/loss effect")
-    manifest["high_dtu_provenance_identity"] = _stable_identity(manifest)
-    return manifest
-
-
 def _raw_interaction_contrasts(
     *,
     modality: str,

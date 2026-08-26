@@ -17,6 +17,7 @@ from fabric.dataset import (
 from fabric.evaluate import (
     OntEpochMonitor,
     ValidationMonitorBundle,
+    _lexicographic_top_winner,
     aggregate_pairing_null,
     apply_joint_cell_permutation,
     build_train_support_bin_assignments,
@@ -51,6 +52,14 @@ from fabric.evaluate import (
     validate_training_run_manifest,
 )
 from fabric.train import build_paired_models, load_config, make_toy_genes
+
+
+def test_top1_ties_use_stable_ids_not_axis_position():
+    winner, tied = _lexicographic_top_winner(
+        ("path:z", "path:a", "path:m"), (1.0, 1.0, 0.0)
+    )
+    assert winner == "path:a"
+    assert tied == {"path:a", "path:z"}
 
 
 def _event_tables():
@@ -568,6 +577,19 @@ def test_pairing_permutation_moves_joint_rows_and_aggregates_after_each_seed():
     aggregated, summary = aggregate_pairing_null(stats, seed_ids=(1, 2, 3))
     assert len(aggregated) == 100
     assert summary.iloc[0]["positive_T_NLL_count"] == 96
+    assert summary.iloc[0]["required_positive_T_NLL_count"] == 95
+    assert bool(summary.iloc[0]["claim_admission_pass"])
+
+    fifty = stats.loc[stats["permutation_index"].lt(50)].copy()
+    fifty["nll_permuted"] = np.where(
+        fifty["permutation_index"].lt(48), 2.0, 0.5
+    )
+    aggregated, summary = aggregate_pairing_null(
+        fifty, seed_ids=(1, 2, 3), repetitions=50
+    )
+    assert len(aggregated) == 50
+    assert summary.iloc[0]["positive_T_NLL_count"] == 48
+    assert summary.iloc[0]["required_positive_T_NLL_count"] == 48
     assert bool(summary.iloc[0]["claim_admission_pass"])
 
 
@@ -1274,7 +1296,6 @@ def test_three_train_frozen_support_tables_keep_empty_subgroups_not_estimable():
             "ont_top1_tie_aware_hit",
             "ont_matrix_cross_entropy",
         ),
-        dtu_provenance_status="PASS",
     )
     assert set(tables.across_seed["stratifier"]) == {
         "matrix_path_count",
@@ -1289,6 +1310,9 @@ def test_three_train_frozen_support_tables_keep_empty_subgroups_not_estimable():
     assert empty["status"].eq("not_estimable").all()
     assert empty["eligible_cell_gene_count"].eq(0).all()
     assert empty["raw_count_denominator"].eq(0).all()
+    assert set(tables.across_seed["dtu_stratum_interpretation"]) == {
+        "frozen_gene_prior"
+    }
     assert not any("adjust" in column.lower() for column in tables.across_seed)
 
     drift = pd.DataFrame(rows)
@@ -1303,5 +1327,4 @@ def test_three_train_frozen_support_tables_keep_empty_subgroups_not_estimable():
             drift,
             assignments,
             metric_columns=("ont_top1_tie_aware_hit",),
-            dtu_provenance_status="PASS",
         )

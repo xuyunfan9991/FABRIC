@@ -11,7 +11,6 @@ from fabric.dataset import (
     build_ont_observation_admission_record,
     build_rna_window_coverage_audit,
     classify_retained_intron_evidence,
-    audit_high_dtu_provenance,
     rebuild_compatible_sets_after_ir_censoring,
 )
 
@@ -191,37 +190,4 @@ def test_ont_observation_process_stays_cross_pipeline_and_pending_until_rebuild(
             path_identity="paths-v2",
             split_identity="splits-v2",
             metric_schema_version="fabric_v2_validation_monitor_v2",
-        )
-
-
-def test_high_dtu_provenance_is_train_only_and_disabled_has_zero_effect():
-    metadata = pd.DataFrame(
-        {
-            "target_gene_id": ["g0", "g1"],
-            "metadata_split_scope": ["train_only", "train_only"],
-            "high_dtu_gene": [True, False],
-            "dtu_source_identity": ["dtu-v1", "dtu-v1"],
-        }
-    )
-    manifest = audit_high_dtu_provenance(
-        metadata,
-        sensitivity_enabled=False,
-        selection_config={
-            "high_dtu_sampling_multiplier": 1.0,
-            "high_dtu_loss_multiplier": 1.0,
-        },
-    )
-    assert manifest["formal_claim_scope"] == "disabled_zero_effect"
-    assert manifest["primary_sampling_or_loss_effect"] == "none"
-    with pytest.raises(ValueError, match="zero sampling/loss effect"):
-        audit_high_dtu_provenance(
-            metadata,
-            sensitivity_enabled=False,
-            selection_config={"high_dtu_sampling_multiplier": 2.0},
-        )
-    with pytest.raises(ValueError, match="train scope"):
-        audit_high_dtu_provenance(
-            metadata.assign(metadata_split_scope=["train_only", "test"]),
-            sensitivity_enabled=True,
-            selection_config={},
         )

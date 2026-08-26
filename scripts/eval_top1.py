@@ -28,7 +28,11 @@ from scipy.special import logsumexp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fabric.evaluate import OntMatrixKlTarget  # noqa: E402
+from fabric.evaluate import (  # noqa: E402
+    OntMatrixKlTarget,
+    _lexicographic_top_winner,
+    compute_validation_ont_matrix_kl,
+)
 from fabric.likelihood import compatible_path_nll  # noqa: E402
 from fabric.model import FABRICV2Model  # noqa: E402
 from fabric.train import (  # noqa: E402
@@ -65,6 +69,7 @@ def ont_top1_and_kl(snapshot, target: OntMatrixKlTarget):
     unique_top1_hits = 0
     unique_top1_total = 0
     observed_tie_cell_genes = 0
+    predicted_tie_cell_genes = 0
 
     for prediction in snapshot.predictions:
         gene_id = str(getattr(prediction, "gene_id"))
@@ -117,25 +122,27 @@ def ont_top1_and_kl(snapshot, target: OntMatrixKlTarget):
             gene_record["ont_count_mass"] += total
             gene_record["kl_weighted_sum"] += total * max(0.0, kl)
 
-            # Ties are broken by lowest path index on both sides, matching
-            # compute_ont_matrix_agreement's `min(...)` over tied identifiers.
-            observed_top = np.flatnonzero(cell_counts == cell_counts.max())
-            predicted_winner = int(np.argmax(cell_logits))
-            observed_winner = int(observed_top[0])
+            observed_winner, observed_top = _lexicographic_top_winner(
+                path_ids, cell_counts
+            )
+            predicted_winner, predicted_top = _lexicographic_top_winner(
+                path_ids, cell_logits
+            )
 
             hit = predicted_winner == observed_winner
             top1_hits += int(hit)
             top1_count_weighted_hits += total * int(hit)
-            tie_aware = int(predicted_winner in set(observed_top.tolist()))
+            tie_aware = int(predicted_winner in observed_top)
             top1_tie_aware_hits += tie_aware
             gene_record["top1_hits"] += int(hit)
             gene_record["top1_count_weighted_hits"] += total * int(hit)
             gene_record["tie_aware_hits"] += tie_aware
-            if observed_top.size == 1:
+            if len(observed_top) == 1:
                 unique_top1_total += 1
                 unique_top1_hits += int(hit)
             else:
                 observed_tie_cell_genes += 1
+            predicted_tie_cell_genes += int(len(predicted_top) > 1)
 
     if eligible_cell_genes == 0:
         raise ValueError("no eligible validation cell-genes")
@@ -151,6 +158,7 @@ def ont_top1_and_kl(snapshot, target: OntMatrixKlTarget):
         "eligible_cell_gene_count": eligible_cell_genes,
         "eligible_count_mass": eligible_count_mass,
         "observed_tie_cell_gene_count": observed_tie_cell_genes,
+        "predicted_tie_cell_gene_count": predicted_tie_cell_genes,
     }
     return aggregate, per_gene
 
@@ -253,6 +261,10 @@ def main() -> int:
         args.fixture,
         gene_cache_capacity=_backed_gene_cache_capacity(config["resources"]),
     )
+    if prepared.input_manifest_id != config["inputs"]["input_manifest_id"]:
+        raise ValueError("prepared dataset identity differs from the requested config")
+    if prepared.compatibility_artifact_id != config["inputs"]["compatibility_artifact_id"]:
+        raise ValueError("prepared compatibility identity differs from the requested config")
     genes = prepared.genes
     device = torch.device(args.device)
     torch.set_float32_matmul_precision("highest")
@@ -281,6 +293,14 @@ def main() -> int:
                 f"snapshot {available[epoch].name} holds completed_epoch="
                 f"{checkpoint['completed_epoch']}, expected {epoch}"
             )
+        run_identity = checkpoint["run_identity"]
+        run_manifest = run_identity["training_run_manifest"]
+        if run_manifest["condition"] != args.condition:
+            raise ValueError("checkpoint condition differs from the requested condition")
+        if run_identity["input_manifest_id"] != prepared.input_manifest_id:
+            raise ValueError("checkpoint and prepared dataset identities differ")
+        if run_identity["compatibility_artifact_id"] != prepared.compatibility_artifact_id:
+            raise ValueError("checkpoint and prepared compatibility identities differ")
         model.load_state_dict(checkpoint["model_state_dict"])
 
         snapshot = _evaluate_split(
@@ -291,8 +311,29 @@ def main() -> int:
             model_config=config["model"],
             resources=config["resources"],
         )
+        official_kl = compute_validation_ont_matrix_kl(snapshot, target)
         record, per_gene = ont_top1_and_kl(snapshot, target)
+        if not np.isclose(
+            record["ont_matrix_kl_count_weighted"],
+            official_kl.ont_matrix_kl_count_weighted,
+            atol=1.0e-12,
+            rtol=0,
+        ):
+            raise AssertionError("top-1 sweep KL differs from the formal validation metric")
         nll_by_gene = per_gene_nll(snapshot)
+        reference = history_kl(run_dir, epoch)
+        if reference is None:
+            raise ValueError(f"history.tsv has no record for completed epoch {epoch}")
+        if not np.isclose(
+            reference,
+            official_kl.ont_matrix_kl_count_weighted,
+            atol=1.0e-9,
+            rtol=0,
+        ):
+            raise AssertionError(
+                f"epoch {epoch} KL differs from history.tsv: "
+                f"{official_kl.ont_matrix_kl_count_weighted} != {reference}"
+            )
         per_gene_path = out_path.parent / (
             f"per_gene_{args.condition}_e{epoch}.tsv"
         )
@@ -304,12 +345,8 @@ def main() -> int:
         record["validation_compatible_path_nll"] = float(snapshot.nll)
         record["elapsed_seconds"] = round(time.time() - started, 1)
 
-        reference = history_kl(run_dir, epoch)
         record["history_kl"] = reference
-        record["kl_matches_history"] = (
-            reference is not None
-            and abs(reference - record["ont_matrix_kl_count_weighted"]) < 1e-9
-        )
+        record["kl_matches_history"] = True
 
         with out_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")

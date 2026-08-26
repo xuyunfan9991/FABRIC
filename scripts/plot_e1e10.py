@@ -3,7 +3,7 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np, pandas as pd
 
-dtu = pd.read_csv("outputs/analysis/dtu_recomputed.tsv", sep="\t")[["gene_id","score_train"]]
+dtu = pd.read_excel("data/DTU_result_sorted.xlsx")[["gene_id", "DTU_score"]]
 rng = np.random.default_rng(1103); NB = 4000
 def load(cond, ep):
     d = pd.read_csv(f"outputs/analysis/macro_eval/per_gene_{cond}_e{ep}.tsv", sep="\t")
@@ -27,11 +27,11 @@ ax = axes[0]
 x = np.arange(len(STRATA))
 for i, cond in enumerate(("full","atac")):
     a,b = load(cond,1), load(cond,10)
-    m = a.merge(b,on="gene_id",suffixes=("_1","_10")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
+    m = a.merge(b,on="gene_id",suffixes=("_1","_10")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
     m["imp"]=m.nll_1-m.nll_10
     vals, err = [], []
     for _, f in STRATA:
-        g=m[f(m.score_train)]; ci=boot(g.imp.values)
+        g=m[f(m.DTU_score)]; ci=boot(g.imp.values)
         vals.append(g.imp.mean()); err.append([g.imp.mean()-ci[0], ci[1]-g.imp.mean()])
     ax.bar(x+(i-0.5)*0.38, vals, 0.38, yerr=np.array(err).T, capsize=3,
            color=COLOR[cond], label=f"{cond}_macro")
@@ -40,19 +40,19 @@ ax.axhline(-0.00856, color="#8c1c2b", ls=":", lw=1.4)
 ax.annotate("old objective, high-DTU late window: −0.009 (regressed)",
             (0.02,0.055), xycoords="axes fraction", fontsize=8, color="#8c1c2b")
 ax.set_xticks(x); ax.set_xticklabels([n for n,_ in STRATA], fontsize=9)
-ax.set_xlabel("train-only DTU stratum"); ax.set_ylabel("NLL improvement e1→e10")
+ax.set_xlabel("frozen DTU prior stratum"); ax.set_ylabel("NLL improvement e1→e10")
 ax.set_title("All strata now learn — incl. high-DTU", fontsize=11)
 ax.legend(fontsize=9); ax.grid(alpha=0.25, axis="y")
 
 # P2: dose-response at e10
 ax = axes[1]
 f10,a10 = load("full",10), load("atac",10)
-g = f10.merge(a10,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
+g = f10.merge(a10,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
 g["delta"]=g.nll_a-g.nll_f
 names = ["all","DTU=0","0–0.1","0.1–0.35","0.35–0.65",">0.65","top-10%"]
-masks = [g.score_train>=0, g.score_train==0, (g.score_train>0)&(g.score_train<=0.1),
-         (g.score_train>0.1)&(g.score_train<=0.35), (g.score_train>0.35)&(g.score_train<=0.65),
-         g.score_train>0.65, g.score_train>=g.score_train.quantile(0.9)]
+masks = [g.DTU_score>=0, g.DTU_score==0, (g.DTU_score>0)&(g.DTU_score<=0.1),
+         (g.DTU_score>0.1)&(g.DTU_score<=0.35), (g.DTU_score>0.35)&(g.DTU_score<=0.65),
+         g.DTU_score>0.65, g.DTU_score>=g.DTU_score.quantile(0.9)]
 for i,(n,msk) in enumerate(zip(names,masks)):
     s=g[msk]; ci=boot(s.delta.values); mu=s.delta.mean()
     sig = ci[0]>0 or ci[1]<0
@@ -61,7 +61,7 @@ for i,(n,msk) in enumerate(zip(names,masks)):
                 capsize=4, lw=2)
 ax.axvline(0,color="black",lw=0.9)
 ax.set_yticks(range(len(names))); ax.set_yticklabels(names[::-1], fontsize=9)
-ax.set_xlabel("full−atac gap at e10  (pos = RNA channel helps)")
+ax.set_xlabel("ATAC − Full NLL at e10  (positive = RNA channel helps)")
 from matplotlib.ticker import MaxNLocator
 ax.xaxis.set_major_locator(MaxNLocator(5))
 ax.set_title("Dose-response: gain concentrates in high-DTU\n(green = 95% CI excludes 0)", fontsize=10.5)

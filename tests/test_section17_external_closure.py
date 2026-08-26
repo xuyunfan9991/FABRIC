@@ -322,7 +322,6 @@ def test_section17_43_selection_rejects_monitor_fields_and_final_axes_are_frozen
         records,
         assignments,
         metric_columns=("metric",),
-        dtu_provenance_status="PASS",
     )
     assert set(result.across_seed["uncertainty_semantics"]) == {
         "optimization_repeat_not_biological_confidence_interval"
@@ -338,7 +337,6 @@ def test_section17_43_selection_rejects_monitor_fields_and_final_axes_are_frozen
             drift,
             assignments,
             metric_columns=("metric",),
-            dtu_provenance_status="PASS",
         )
 
     missing_identity = records.copy()
@@ -348,7 +346,6 @@ def test_section17_43_selection_rejects_monitor_fields_and_final_axes_are_frozen
             missing_identity,
             assignments,
             metric_columns=("metric",),
-            dtu_provenance_status="PASS",
         )
 
 

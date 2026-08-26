@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np, pandas as pd
 from pathlib import Path
 
-dtu = pd.read_csv("outputs/analysis/dtu_recomputed.tsv", sep="\t")[["gene_id","score_train"]]
+dtu = pd.read_excel("data/DTU_result_sorted.xlsx")[["gene_id", "DTU_score"]]
 rng = np.random.default_rng(1103); NB = 4000
 
 def load(cond, ep):
@@ -44,11 +44,11 @@ STRATA = [
 series = {name: {"mu": [], "lo": [], "hi": []} for name, _, _ in STRATA}
 for ep in epochs:
     f, a = load("full", ep), load("atac", ep)
-    g = f.merge(a, on="gene_id", suffixes=("_f","_a")).merge(dtu, on="gene_id").dropna(subset=["score_train"])
+    g = f.merge(a, on="gene_id", suffixes=("_f","_a")).merge(dtu, on="gene_id").dropna(subset=["DTU_score"])
     g["delta"] = g.nll_a - g.nll_f
-    q90 = g.score_train.quantile(0.9)
+    q90 = g.DTU_score.quantile(0.9)
     for name, _, fn in STRATA:
-        mask = g.score_train >= q90 if fn is None else fn(g.score_train)
+        mask = g.DTU_score >= q90 if fn is None else fn(g.DTU_score)
         s = g[mask]; ci = boot(s.delta.values)
         series[name]["mu"].append(s.delta.mean())
         series[name]["lo"].append(ci[0]); series[name]["hi"].append(ci[1])
@@ -80,7 +80,7 @@ ax.annotate("full: LR/2\n(atac unchanged)", (full_lr_drop, 0.98),
             ha="left", textcoords="offset points", xytext=(4, -16))
 ax.set_xticks(hist_epochs)
 ax.set_xlabel("epoch")
-ax.set_ylabel("atac − full  per-gene macro NLL  (pos = RNA channel helps)")
+ax.set_ylabel("ATAC − Full per-gene macro NLL  (positive = RNA channel helps)")
 ax.set_title("Gap trajectory by DTU stratum — gene-bootstrap 95% CIs\n"
              "(matched LR through e8; single-epoch forests hide this volatility)",
              fontsize=11)

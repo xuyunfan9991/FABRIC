@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from itertools import combinations
 import json
-from math import comb
+from math import ceil, comb
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -1714,6 +1714,19 @@ def build_ont_matrix_scope(
     return OntMatrixScope(table, pd.DataFrame(conservation))
 
 
+def _lexicographic_top_winner(
+    labels: Sequence[str], values: Sequence[float]
+) -> tuple[str, set[str]]:
+    """Return the lexicographically first stable ID among exact top ties."""
+
+    label_array = np.asarray(labels, dtype=str)
+    value_array = np.asarray(values)
+    if len(label_array) == 0 or label_array.shape != value_array.shape:
+        raise ValueError("top-1 labels and values require the same nonempty axis")
+    tied = set(label_array[np.flatnonzero(value_array == value_array.max())])
+    return min(tied), tied
+
+
 def compute_ont_matrix_agreement(
     identity: OntMatrixIdentity,
     scope: OntMatrixScope,
@@ -1765,12 +1778,12 @@ def compute_ont_matrix_agreement(
         prism_ce = float(-np.sum(q[positive] * np.log(np.maximum(prism_probability[positive], 1.0e-12))))
         prism_d = prism_ce - entropy
 
-        observed_max = counts.max()
-        observed_top = {transcript_ids[index] for index in np.flatnonzero(counts == observed_max)}
-        observed_winner = min(observed_top)
-        predicted_max = matrix_log_probability.max()
-        predicted_top = {transcript_ids[index] for index in np.flatnonzero(matrix_log_probability == predicted_max)}
-        predicted_winner = min(predicted_top)
+        observed_winner, observed_top = _lexicographic_top_winner(
+            transcript_ids, counts
+        )
+        predicted_winner, predicted_top = _lexicographic_top_winner(
+            transcript_ids, matrix_log_probability
+        )
         records.append(
             {
                 "cell_id": candidate.cell_id,
@@ -2023,8 +2036,12 @@ def aggregate_pairing_null(
             gate = False
         else:
             positive_count = int(aggregate["T_NLL"].gt(0).sum())
+            required_positive_count = ceil(0.95 * repetitions)
             empirical_95 = float(np.quantile(aggregate["T_attr"], 0.95, method="higher"))
-            gate = positive_count >= 95 and paired_attr > empirical_95
+            gate = (
+                positive_count >= required_positive_count
+                and paired_attr > empirical_95
+            )
             status = "pass" if gate else "fail"
         summaries.append(
             {
@@ -2032,6 +2049,7 @@ def aggregate_pairing_null(
                 "status": status,
                 "claim_admission_pass": gate,
                 "positive_T_NLL_count": int(aggregate["T_NLL"].gt(0).sum()),
+                "required_positive_T_NLL_count": ceil(0.95 * repetitions),
                 "paired_T_attr": paired_attr,
                 "null_T_NLL_median": float(aggregate["T_NLL"].median()),
                 "null_T_NLL_iqr": _iqr(aggregate["T_NLL"]),
@@ -3370,14 +3388,11 @@ def summarize_support_stratified_sensitivity(
     assignments: pd.DataFrame,
     *,
     metric_columns: Sequence[str],
-    dtu_provenance_status: str,
 ) -> SupportStratifiedSensitivity:
     """Report high/non-high-DTU metrics in each frozen one-dimensional bin."""
 
     if not metric_columns:
         raise ValueError("support-stratified reporting requires at least one metric")
-    if not str(dtu_provenance_status).strip():
-        raise ValueError("DTU provenance status must be explicit")
     required = (
         "condition",
         "seed",
@@ -3522,14 +3537,7 @@ def summarize_support_stratified_sensitivity(
                                         "eligible_cell_gene_count": cell_gene_count,
                                         "raw_count_denominator": raw_denominator,
                                         "metric_cell_gene_denominator": int(valid.sum()),
-                                        "dtu_provenance_status": str(
-                                            dtu_provenance_status
-                                        ),
-                                        "dtu_stratum_interpretation": (
-                                            "predeclared_evaluation_stratum"
-                                            if str(dtu_provenance_status) == "PASS"
-                                            else "external_diagnostic_stratum"
-                                        ),
+                                        "dtu_stratum_interpretation": "frozen_gene_prior",
                                     }
                                 )
     per_seed = pd.DataFrame(per_seed_rows)
@@ -3579,12 +3587,7 @@ def summarize_support_stratified_sensitivity(
                 "uncertainty_semantics": (
                     "optimization_repeat_not_biological_confidence_interval"
                 ),
-                "dtu_provenance_status": str(dtu_provenance_status),
-                "dtu_stratum_interpretation": (
-                    "predeclared_evaluation_stratum"
-                    if str(dtu_provenance_status) == "PASS"
-                    else "external_diagnostic_stratum"
-                ),
+                "dtu_stratum_interpretation": "frozen_gene_prior",
             }
         )
     return SupportStratifiedSensitivity(

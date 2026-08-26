@@ -1035,6 +1035,11 @@ def build_candidate_routes(
                 if not (int(event.start) < region_end and int(event.end) > region_start):
                     continue
                 anchor_position = int(anchor.anchor_position)
+                if str(anchor.modality) == "RNA" and str(anchor.anchor_type) == "TSS":
+                    if str(anchor.strand) == "+" and int(event.start) < anchor_position:
+                        continue
+                    if str(anchor.strand) == "-" and int(event.end) > anchor_position:
+                        continue
                 if int(event.start) < anchor_position < int(event.end):
                     side = "OVERLAP_ANCHOR"
                     signed_distance = np.nan
@@ -1095,6 +1100,9 @@ def build_candidate_routes(
     routes = pd.DataFrame(rows, columns=EVENT_ROUTE_COLUMNS)
     if routes.empty:
         return routes
+    rna_tss = routes["modality"].eq("RNA") & routes["anchor_type"].eq("TSS")
+    if not routes.loc[rna_tss, "transcript_oriented_side"].eq("DOWNSTREAM").all():
+        raise AssertionError("RNA TSS routes must lie wholly downstream of the TSS")
     key = ["event_id", "anchor_region_id", "anchor_site_id", "edge_id"]
     if routes.duplicated(key).any() or routes["route_id"].duplicated().any():
         raise ValueError("candidate EventRouteTable primary key is not unique")

@@ -1,4 +1,4 @@
-"""Top-1 movement e19->e30, and the DTU-stratified full-vs-atac NLL gap."""
+"""Top-1 movement e19->e30 and the frozen-DTU-stratified Full/ATAC NLL gap."""
 import json
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,22 +31,41 @@ ax1.set_ylabel("ONT top-1 accuracy"); ax1.set_ylim(0.45, 0.60)
 ax1.set_title("ONT top-1 accuracy rises from e19 to e30 while KL worsens  (green = improved)", fontsize=11.5)
 ax1.legend(ncol=4, fontsize=9); ax1.grid(alpha=0.25, axis="y")
 
-# --- panel 2: DTU-decile gap, macro vs molecule-weighted ---
+# --- panel 2: frozen-DTU quantile-bin gap, macro vs molecule-weighted ---
 dtu = pd.read_excel("data/DTU_result_sorted.xlsx")[["gene_id", "DTU_score"]]
 f = pd.read_csv("outputs/analysis/per_gene_full_e30.tsv", sep="\t")
 a = pd.read_csv("outputs/analysis/per_gene_atac_e30.tsv", sep="\t")
 m = f[f.nll_molecule_mass > 0].merge(a, on="gene_id", suffixes=("_f", "_a")).merge(dtu, on="gene_id")
 m["delta"] = m.nll_weighted_sum_a / m.nll_molecule_mass_a - m.nll_weighted_sum_f / m.nll_molecule_mass_f
-m["decile"] = pd.qcut(m.DTU_score, 10, labels=False, duplicates="drop")
-g = m.groupby("decile")
+m["quantile_bin"], bin_edges = pd.qcut(
+    m.DTU_score, 10, labels=False, retbins=True, duplicates="drop"
+)
+g = m.groupby("quantile_bin")
 macro = g["delta"].mean()
 weighted = g.apply(lambda t: (t.nll_weighted_sum_a.sum() - t.nll_weighted_sum_f.sum())
                    / t.nll_molecule_mass_f.sum(), include_groups=False)
+n_bins = len(macro)
+summary = g.agg(
+    gene_count=("gene_id", "size"),
+    dtu_score_min=("DTU_score", "min"),
+    dtu_score_max=("DTU_score", "max"),
+).reset_index()
+summary["quantile_bin"] = summary["quantile_bin"].astype(int) + 1
+summary["cut_left"] = bin_edges[:-1]
+summary["cut_right"] = bin_edges[1:]
+summary["macro_nll_atac_minus_full"] = macro.to_numpy()
+summary["molecule_weighted_nll_atac_minus_full"] = weighted.to_numpy()
+summary["requested_quantile_count"] = 10
+summary["actual_quantile_count"] = n_bins
+summary.to_csv("outputs/analysis/top1_dtu_quantile_bins.tsv", sep="\t", index=False)
 dec = np.arange(1, len(macro) + 1)
 ax2.bar(dec - 0.19, macro.values, 0.38, label="macro (per-gene equal weight)", color="#4a7c59")
 ax2.bar(dec + 0.19, weighted.values, 0.38, label="molecule-weighted", color="#e08a3c")
 ax2.axhline(0, color="black", lw=0.9)
-ax2.set_xticks(dec); ax2.set_xlabel("DTU decile  (1 = most stable, 10 = most switching)")
+ax2.set_xticks(dec)
+ax2.set_xlabel(
+    f"frozen DTU prior quantile bin (1 = most stable, {n_bins} = most switching)"
+)
 ax2.set_ylabel("NLL gap: atac − full\n(positive = full better)")
 ax2.set_title("No monotone DTU trend — and the two weightings disagree in sign (e30)", fontsize=11.5)
 ax2.legend(fontsize=9); ax2.grid(alpha=0.25, axis="y")

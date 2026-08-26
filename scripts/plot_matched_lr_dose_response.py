@@ -10,7 +10,7 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np, pandas as pd
 
-dtu = pd.read_csv("outputs/analysis/dtu_recomputed.tsv", sep="\t")[["gene_id","score_train"]]
+dtu = pd.read_excel("data/DTU_result_sorted.xlsx")[["gene_id", "DTU_score"]]
 rng = np.random.default_rng(1103); NB = 4000
 
 def load(cond, ep):
@@ -27,14 +27,14 @@ def boot(x, nb=NB, batch=500):
 
 names = ["all","DTU=0","0–0.1","0.1–0.35","0.35–0.65",">0.65","top-10%"]
 def strata(g):
-    return [g.score_train>=0, g.score_train==0, (g.score_train>0)&(g.score_train<=0.1),
-            (g.score_train>0.1)&(g.score_train<=0.35), (g.score_train>0.35)&(g.score_train<=0.65),
-            g.score_train>0.65, g.score_train>=g.score_train.quantile(0.9)]
+    return [g.DTU_score>=0, g.DTU_score==0, (g.DTU_score>0)&(g.DTU_score<=0.1),
+            (g.DTU_score>0.1)&(g.DTU_score<=0.35), (g.DTU_score>0.35)&(g.DTU_score<=0.65),
+            g.DTU_score>0.65, g.DTU_score>=g.DTU_score.quantile(0.9)]
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 4.8), sharey=True, sharex=True)
 for ax, ep in zip(axes, (7, 8)):
     f, a = load("full", ep), load("atac", ep)
-    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
+    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
     g["delta"] = g.nll_a - g.nll_f
     for i,(name,mask) in enumerate(zip(names, strata(g))):
         s=g[mask]; ci=boot(s.delta.values); mu=s.delta.mean()
@@ -44,7 +44,7 @@ for ax, ep in zip(axes, (7, 8)):
                     capsize=4, lw=2)
     ax.axvline(0,color="black",lw=0.9)
     ax.set_yticks(range(len(names))); ax.set_yticklabels(names[::-1], fontsize=9)
-    ax.set_xlabel("full−atac gap  (pos = RNA channel helps)")
+    ax.set_xlabel("ATAC − Full NLL  (positive = RNA channel helps)")
     ax.set_title(f"epoch {ep}", fontsize=11)
     ax.grid(alpha=0.25, axis="x")
 fig.suptitle("Matched-LR dose-response (both arms at base LR 5e-5)\n"
@@ -55,7 +55,7 @@ print("outputs/analysis/matched_lr_dose_response.png")
 
 for ep in (7, 8):
     f, a = load("full", ep), load("atac", ep)
-    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
+    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
     g["delta"] = g.nll_a - g.nll_f
     print(f"e{ep}:")
     for name, mask in zip(names, strata(g)):

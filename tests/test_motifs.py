@@ -92,6 +92,24 @@ def test_site_windows_follow_transcript_direction_and_ignore_gene_bounds():
     assert tss.region_clipped
 
 
+def test_rna_tss_window_is_transcript_downstream_only():
+    expected = {
+        "+": (1_000, 1_250),
+        "-": (1_750, 2_000),
+    }
+    for strand in ("+", "-"):
+        anchors = build_graph_anchor_regions(
+            _endpoint_graph(strand),
+            modality="RNA",
+            site_flanks={"TSS": (0, 250)},
+            maximum_short_exon_bp=500,
+            contig_lengths={"chr1": 3_000},
+            gene_bounds=(1_000, 2_001),
+        )
+        tss = anchors.loc[anchors["anchor_type"].eq("TSS")].iloc[0]
+        assert (tss.region_start, tss.region_end) == expected[strand]
+
+
 def test_factor_catalog_rejects_empty_or_duplicate_identity_members():
     base = {
         "modality": ["DNA"],
@@ -375,6 +393,45 @@ def test_site_route_geometry_has_strict_overlap_na_touch_and_negative_half_cente
     assert touch.signed_distance_bp == -1.0
     assert negative.transcript_oriented_side == "UPSTREAM"
     assert negative.signed_distance_bp == -4.5
+
+
+def test_rna_tss_routes_exclude_upstream_and_crossing_events_on_both_strands():
+    events = pd.DataFrame(
+        [
+            _event("plus_upstream"),
+            _event("plus_crossing"),
+            _event("plus_downstream"),
+            _event("minus_downstream"),
+            _event("minus_crossing"),
+            _event("minus_upstream"),
+        ]
+    )
+    events.loc[0, ["start", "end"]] = [94, 100]
+    events.loc[1, ["start", "end"]] = [99, 102]
+    events.loc[2, ["start", "end"]] = [100, 106]
+    events.loc[3, ["start", "end", "strand"]] = [94, 100, "-"]
+    events.loc[4, ["start", "end", "strand"]] = [99, 102, "-"]
+    events.loc[5, ["start", "end", "strand"]] = [100, 106, "-"]
+    anchors = pd.DataFrame(
+        {
+            "target_gene_id": ["g", "g"],
+            "modality": ["RNA", "RNA"],
+            "anchor_region_id": ["plus", "minus"],
+            "anchor_site_id": ["s+", "s-"],
+            "edge_id": ["e+", "e-"],
+            "chromosome": ["chr1", "chr1"],
+            "strand": ["+", "-"],
+            "region_start": [90, 90],
+            "region_end": [110, 110],
+            "anchor_position": [100, 100],
+            "region_type": ["exon", "exon"],
+            "anchor_type": ["TSS", "TSS"],
+            "geometry_kind": ["site_window", "site_window"],
+        }
+    )
+    routes = build_candidate_routes(events, anchors)
+    assert set(routes["event_id"]) == {"plus_downstream", "minus_downstream"}
+    assert routes["transcript_oriented_side"].eq("DOWNSTREAM").all()
 
 
 def test_overlap_geometry_uses_zero_cap_proximity_without_nan_ordering():

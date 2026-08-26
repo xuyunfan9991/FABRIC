@@ -18,12 +18,12 @@ sources:
 
   rna_counts: /home1/xyf/project/Multi_Omic/data/gene_matrix_Illumina/gene_matrix_Illumina.h5ad
   rna_cell_metadata: /home1/xyf/project/Multi_Omic/data/gene_matrix_Illumina/cell_meta_final.aligned.tsv
-  rna_atac_glue_embedding: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/glue/combined_glue_5kb_embedding.h5ad
-  rna_atac_glue_provenance: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/glue/run_glue_5kb_provenance.json
-  consensus_peak_bed: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/consensus_peaks.bed
-  atac_peak_counts: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/peak_matrix_with_developmental_system.h5ad
-  peak_provenance: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/provenance.json
-  peak_validation: /home2/xyf/project/PRISM/outputs/cs15_atac_merged_peakglue_cellranger_2024A_v4/sensitivity/global_5kb_glue_broad_system_no_knn_v1/peak_rebuild_previous_v4_params_v1/peak_calling/validation_summary.json
+  rna_atac_glue_embedding: /home2/xyf/project/atac_first_glue_v1/release/coembedding/broad_coembedding.h5ad
+  rna_atac_glue_provenance: /home2/xyf/project/atac_first_glue_v1/release/README.md
+  consensus_peak_bed: /home2/xyf/project/atac_first_glue_v1/release/ccre/ccre_catalog.bed
+  atac_peak_counts: /home2/xyf/project/atac_first_glue_v1/release/ccre/ccre_matrix.h5ad
+  peak_provenance: /home2/xyf/project/atac_first_glue_v1/release/ccre/provenance.json
+  peak_validation: /home2/xyf/project/atac_first_glue_v1/release/ccre/peak_calling_qc.tsv
 
   reference_fasta: /home2/xyf/project/PRISM/data/reference/genome.fa
   reference_fasta_index: /home2/xyf/project/PRISM/data/reference/genome.fa.fai
@@ -36,9 +36,9 @@ sources:
   rna_motif_gene_map: /home2/xyf/project/PRISM/data/motifs/cisbp_rna_human_motif_gene_map.tsv
 
 derived:
-  rna_atac_neighbors: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/cell_context/rna_atac_neighbors.parquet
-  ont_validation_kl_target: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1/ont_validation_kl_target
-  real_dataset: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v1
+  rna_atac_neighbors: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v2/cell_context/rna_atac_neighbors.parquet
+  ont_validation_kl_target: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v2/ont_validation_kl_target
+  real_dataset: /home2/xyf/project/FABRIC/data/processed/fabric_v2_real_dataset_atomic_introns_v2
 
 expected:
   structural_candidate_gene_count: 17706
@@ -50,12 +50,12 @@ expected:
   validation_cell_count: 21788
   test_cell_count: 21788
   rna_count_shape: [217933, 32351]
-  glue_shape: [438338, 0]
-  glue_embedding_shape: [438338, 50]
+  glue_shape: [411196, 0]
+  glue_embedding_shape: [411196, 50]
   glue_rna_count: 205864
-  glue_atac_count: 232474
-  atac_peak_count_shape: [232474, 753753]
-  consensus_peak_count: 753753
+  glue_atac_count: 205332
+  atac_peak_count_shape: [205332, 853238]
+  consensus_peak_count: 853238
   compatible_test_rows: ABSENT_NOT_MATERIALIZED
   ont_validation_kl_path_count: 90361
   ont_validation_kl_cell_count: 21788

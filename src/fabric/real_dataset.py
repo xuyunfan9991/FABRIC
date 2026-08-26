@@ -67,6 +67,11 @@ EXPECTED = {
     "test_cell_count": 21_788,
     "g_fit_gene_count": 17_600,
     "graph_only_gene_count": 106,
+    "glue_rna_count": 205_864,
+    "glue_atac_count": 205_332,
+    "glue_cell_count": 411_196,
+    "glue_embedding_dim": 50,
+    "atac_peak_count": 853_238,
 }
 
 _ATTRIBUTE = re.compile(r'(\w+) "([^"]*)"')
@@ -832,11 +837,35 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
     modalities = glue_obs["modality"].astype(str)
     rna_mask = modalities.eq("RNA").to_numpy()
     atac_mask = modalities.eq("ATAC").to_numpy()
-    if int(rna_mask.sum()) != 205_864 or int(atac_mask.sum()) != 232_474:
+    if (
+        int(rna_mask.sum()) != EXPECTED["glue_rna_count"]
+        or int(atac_mask.sum()) != EXPECTED["glue_atac_count"]
+    ):
         raise ValueError("GLUE RNA/ATAC modality counts drift")
     embedding = np.asarray(glue.obsm["X_glue"], dtype=np.float32)
-    if embedding.shape != (438_338, 50) or not np.isfinite(embedding).all():
-        raise ValueError("GLUE embedding is not finite full shape [438338,50]")
+    expected_embedding_shape = (
+        EXPECTED["glue_cell_count"],
+        EXPECTED["glue_embedding_dim"],
+    )
+    if embedding.shape != expected_embedding_shape or not np.isfinite(embedding).all():
+        raise ValueError(
+            f"GLUE embedding is not finite full shape {expected_embedding_shape}"
+        )
+
+    stage_to_window = {
+        "CS11": "CS10-12",
+        "CS12": "CS10-12",
+        "CS13": "CS13-15",
+        "CS14": "CS13-15",
+        "CS15": "CS13-15",
+        "CS15-16": "CS13-15",
+    }
+    glue_obs["stage_window"] = glue_obs["stage_shared"].astype(str).map(stage_to_window)
+    if glue_obs["stage_window"].isna().any():
+        missing = sorted(
+            set(glue_obs.loc[glue_obs["stage_window"].isna(), "stage_shared"].astype(str))
+        )
+        raise ValueError(f"release GLUE stages lack a FABRIC stage window: {missing}")
 
     glue_rna = glue_obs.loc[rna_mask].copy()
     glue_rna["cell_id"] = glue_rna["glue_cell_id"].astype(str)
@@ -844,21 +873,26 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
         set(split["cell_id"].astype(str))
     ):
         raise ValueError("GLUE RNA identities are not a unique subset of frozen RNA cells")
-    # Freeze the stage-to-window transformation from overlapping RNA metadata;
-    # it is never inferred from held-out compatible outcomes.
-    stage_map_rows = metadata[["cell_id", "stage"]].merge(
-        glue_rna[["cell_id", "stage_window"]],
+    release_rna_metadata = metadata[
+        ["cell_id", "stage", "developmental_system"]
+    ].merge(
+        glue_rna[["cell_id", "stage_shared", "developmental_system"]],
         on="cell_id",
         how="inner",
+        suffixes=("_rna_counts", "_release"),
         validate="one_to_one",
     )
-    stage_map = stage_map_rows.groupby("stage", sort=True)["stage_window"].agg(
-        lambda values: sorted(set(map(str, values)))
+    if not release_rna_metadata["developmental_system_rna_counts"].astype(str).equals(
+        release_rna_metadata["developmental_system_release"].astype(str)
+    ):
+        raise ValueError("release GLUE RNA developmental systems differ from RNA counts")
+    expected_shared_stage = release_rna_metadata["stage"].astype(str).replace(
+        {"CS15-16": "CS15"}
     )
-    ambiguous = {str(key): value for key, value in stage_map.items() if len(value) != 1}
-    if ambiguous:
-        raise ValueError(f"RNA stage maps to multiple GLUE stage windows: {ambiguous}")
-    stage_to_window = {str(key): value[0] for key, value in stage_map.items()}
+    if not expected_shared_stage.equals(
+        release_rna_metadata["stage_shared"].astype(str)
+    ):
+        raise ValueError("release GLUE RNA stages differ from RNA count metadata")
     target_meta = target.merge(
         metadata[["cell_id", "stage", "developmental_system"]],
         on="cell_id",
@@ -884,15 +918,16 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
     )
     if glue_atac_ids != atac_ids:
         raise ValueError("GLUE ATAC axis differs from the peak-count matrix axis")
-    if set(glue_atac["developmental_system"].astype(str)) != {"Unknown"}:
+    if not glue_atac["developmental_system"].astype(str).reset_index(drop=True).equals(
+        atac.obs["developmental_system"].astype(str).reset_index(drop=True)
+    ):
         raise ValueError(
-            "combined GLUE ATAC developmental_system is neither the documented "
-            "Unknown placeholder nor a reviewed usable label"
+            "release GLUE ATAC developmental systems differ from the peak-count matrix"
         )
-    peak_system = atac.obs["developmental_system"].astype(str).to_numpy()
-    if np.any(pd.isna(peak_system)) or set(peak_system) == {"Unknown"}:
-        raise ValueError("peak-count ATAC developmental-system labels are unavailable")
-    glue_atac["developmental_system"] = peak_system
+    if not glue_atac["stage_shared"].astype(str).reset_index(drop=True).equals(
+        atac.obs["carnegie_stage"].astype(str).reset_index(drop=True)
+    ):
+        raise ValueError("release GLUE ATAC stages differ from the peak-count matrix")
 
     neighbor_rows: list[pd.DataFrame] = []
     audit_rows: list[dict[str, object]] = []
@@ -1058,8 +1093,8 @@ def build_cell_context_stage(paths: Mapping[str, Path], output: Path) -> None:
         "admitted_k_policy": "1..30 neighbors within the frozen absolute distance range",
         "strata": ["developmental_system", "stage_window"],
         "stratum_field_sources": {
-            "developmental_system": "atac_peak_counts.obs.developmental_system",
-            "stage_window": "rna_atac_glue_embedding.obs.stage_window",
+            "developmental_system": "release coembedding and cCRE matrix annotations",
+            "stage_window": "explicit FABRIC mapping of release stage_shared",
         },
         "distance": "euclidean_in_frozen_50d_X_glue",
         "train_only_threshold": "per-stratum q99 nearest RNA-to-ATAC distance",
@@ -1467,7 +1502,7 @@ def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
             fields = line.rstrip("\n").split("\t")
             contig_lengths[fields[0]] = int(fields[1])
     dna_flanks = {"TSS": (2_000, 500), "donor": (250, 250), "acceptor": (250, 250), "PAS": (500, 2_000)}
-    rna_flanks = {"TSS": (250, 250), "donor": (250, 250), "acceptor": (250, 250), "PAS": (250, 250)}
+    rna_flanks = {"TSS": (0, 250), "donor": (250, 250), "acceptor": (250, 250), "PAS": (250, 250)}
     anchors: list[pd.DataFrame] = []
     for graph in _load_real_graphs(graph_root):
         positions = graph.nodes["pos_0based"].to_numpy(np.int64)
@@ -1514,8 +1549,13 @@ def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
     )
     peak_bed["peak_row_0based"] = np.arange(len(peak_bed), dtype=np.int64)
     peak_bed["peak_support"] = np.float32(1.0)
-    if len(peak_bed) != 753_753 or peak_bed["peak_id"].duplicated().any():
-        raise ValueError("consensus peak catalog is not 753,753 unique intervals")
+    if (
+        len(peak_bed) != EXPECTED["atac_peak_count"]
+        or peak_bed["peak_id"].duplicated().any()
+    ):
+        raise ValueError(
+            f"consensus peak catalog is not {EXPECTED['atac_peak_count']:,} unique intervals"
+        )
     atac = ad.read_h5ad(paths["atac_peak_counts"], backed="r")
     if tuple(peak_bed["peak_id"].astype(str)) != tuple(atac.var_names.astype(str)):
         raise ValueError("consensus BED order differs from the ATAC peak matrix axis")
@@ -1574,7 +1614,7 @@ def build_anchor_stage(paths: Mapping[str, Path], output: Path) -> None:
 
 
 def build_atac_normalization_stage(paths: Mapping[str, Path], output: Path) -> None:
-    """Normalize every real ATAC cell once on the full 753,753-peak denominator."""
+    """Normalize every release ATAC cell once on the full cCRE denominator."""
 
     import anndata as ad
     from scipy import sparse
@@ -1582,7 +1622,7 @@ def build_atac_normalization_stage(paths: Mapping[str, Path], output: Path) -> N
     context_root = output / "cell_context"
     context_root.mkdir(parents=True, exist_ok=True)
     atac = ad.read_h5ad(paths["atac_peak_counts"])
-    if atac.shape != (232_474, 753_753):
+    if atac.shape != (EXPECTED["glue_atac_count"], EXPECTED["atac_peak_count"]):
         raise ValueError("ATAC peak-count matrix full shape drift")
     normalized, library_size = normalize_log1p_counts(atac.X, target_sum=10_000.0)
     sparse.save_npz(

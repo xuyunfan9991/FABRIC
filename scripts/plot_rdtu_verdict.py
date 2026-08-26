@@ -1,6 +1,6 @@
 """Verdict figure for R005 (variant 3) vs variant 2 on the DTU question.
 
-Panel 1: high-DTU (>0.65) full-atac gap at every epoch with per-gene TSVs,
+Panel 1: high-DTU (>0.65) Full/ATAC gap at every epoch with per-gene TSVs,
 variant 3 solid vs variant 2 dotted, showing the seed-locked oscillation and
 where each run stopped.  Panel 2: within-arm improvement of variant 3 over
 variant 2 by DTU stratum at e7/e8 -- the direct effect of the new loss.
@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-dtu = pd.read_csv("outputs/analysis/dtu_recomputed.tsv", sep="\t")[["gene_id","score_train"]]
+dtu = pd.read_excel("data/DTU_result_sorted.xlsx")[["gene_id", "DTU_score"]]
 rng = np.random.default_rng(1103)
 
 def load(base, cond, ep):
@@ -31,8 +31,8 @@ def boot(x, nb=4000, batch=500):
 
 def hi_gap(base, ep):
     f, a = load(base,"full",ep), load(base,"atac",ep)
-    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
-    s = g[g.score_train > 0.65]
+    g = f.merge(a,on="gene_id",suffixes=("_f","_a")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
+    s = g[g.DTU_score > 0.65]
     d = (s.nll_a - s.nll_f).values
     ci = boot(d)
     return d.mean(), ci
@@ -69,9 +69,9 @@ slot = 0
 for cond in ("full","atac"):
     for ep in (7,8):
         v3, v2 = load("rdtu_eval",cond,ep), load("macro_eval",cond,ep)
-        m = v3.merge(v2,on="gene_id",suffixes=("_3","_2")).merge(dtu,on="gene_id").dropna(subset=["score_train"])
+        m = v3.merge(v2,on="gene_id",suffixes=("_3","_2")).merge(dtu,on="gene_id").dropna(subset=["DTU_score"])
         m["d"] = m.nll_2 - m.nll_3
-        vals = [m[fn(m.score_train)].d.mean() for _, fn in strata]
+        vals = [m[fn(m.DTU_score)].d.mean() for _, fn in strata]
         color = "#1b6ca8" if cond=="full" else "#d1495b"
         ax.bar(x+(slot-1.5)*width, vals, width, color=color, alpha=1.0 if ep==7 else 0.55,
                label=f"{cond} e{ep}")
@@ -79,7 +79,7 @@ for cond in ("full","atac"):
 ax.axhline(0, color="black", lw=0.9)
 ax.set_xticks(x)
 ax.set_xticklabels([n for n, _ in strata])
-ax.set_xlabel("train-only DTU stratum")
+ax.set_xlabel("frozen DTU prior stratum")
 ax.set_ylabel("variant2 − variant3 NLL  (pos = new loss better)")
 ax.set_title("Direct effect of the new loss: gains grow with DTU,\nboth arms, e7/e8", fontsize=10.5)
 ax.legend(fontsize=8.5)
