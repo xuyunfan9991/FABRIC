@@ -1152,6 +1152,104 @@ def test_max_epoch_continuation_exactly_matches_uninterrupted_training(tmp_path)
     assert lineage["held_out_test_evaluated"] is False
 
 
+def test_early_stopped_continuation_with_patience_at_cap_matches_uninterrupted(
+    tmp_path, monkeypatch
+):
+    parent_config = load_config("configs/fabric_v2_toy.yaml")
+    parent_config["training"]["max_epochs"] = 5
+    parent_config["training"]["early_stopping_patience"] = 2
+    continuation_config = copy.deepcopy(parent_config)
+    continuation_config["training"]["early_stopping_patience"] = 5
+    genes = make_toy_genes(seed=37)
+
+    monkeypatch.setattr(
+        train_module,
+        "_evaluate_split",
+        lambda *args, **kwargs: ValidationSnapshot(
+            split="val",
+            weighted_nll_sum=1.0,
+            informative_molecule_mass=1.0,
+            predictions=(),
+        ),
+    )
+    parent_dir = tmp_path / "early_stopped_parent"
+    train_run(
+        genes,
+        parent_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=parent_dir,
+    )
+    parent_latest = torch.load(
+        parent_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    assert parent_latest["completed_epoch"] == 3
+    assert parent_latest["best_epoch"] == 1
+    assert parent_latest["epochs_without_improvement"] == 2
+    assert parent_latest["training_complete"]
+
+    continuation_dir = tmp_path / "patience_disabled_continuation"
+    continued = train_run(
+        genes,
+        continuation_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=continuation_dir,
+        continue_from=parent_dir / "latest.pt",
+    )
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    uninterrupted = train_run(
+        genes,
+        continuation_config,
+        seed=42,
+        condition="full",
+        device="cpu",
+        run_dir=uninterrupted_dir,
+    )
+    pd.testing.assert_frame_equal(
+        continued.result.history, uninterrupted.result.history, check_exact=True
+    )
+    continued_latest = torch.load(
+        continuation_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    uninterrupted_latest = torch.load(
+        uninterrupted_dir / "latest.pt", map_location="cpu", weights_only=False
+    )
+    for state_name in (
+        "completed_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "lr_scheduler_state_dict",
+        "best_epoch",
+        "best_validation_nll",
+        "best_model_state_dict",
+        "best_optimizer_state_dict",
+        "best_lr_scheduler_state_dict",
+        "epochs_without_improvement",
+        "history_rows",
+        "monitor_records",
+        "gene_order_rng_state",
+        "global_rng_state",
+        "training_complete",
+        "held_out_test_evaluated",
+    ):
+        _assert_nested_equal(
+            continued_latest[state_name], uninterrupted_latest[state_name]
+        )
+    assert sorted(
+        path.name for path in (continuation_dir / "epoch_checkpoints").glob("*.pt")
+    ) == ["epoch_4.pt", "epoch_5.pt"]
+    lineage = json.loads(
+        (continuation_dir / "continuation_manifest.json").read_text()
+    )
+    assert lineage["parent_completed_epoch"] == 3
+    assert lineage["parent_stop_reason"] == "early_stopping_patience"
+    assert lineage["parent_early_stopping_patience"] == 2
+    assert lineage["continuation_early_stopping_patience"] == 5
+
+
 def test_max_epoch_continuation_rejects_any_other_config_change(tmp_path):
     parent_config = load_config("configs/fabric_v2_toy.yaml")
     parent_config["training"]["max_epochs"] = 1

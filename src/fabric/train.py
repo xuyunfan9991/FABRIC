@@ -3035,12 +3035,14 @@ def train_run(
         )
         resume_checkpoint: Mapping[str, object] | None = None
         resume_checkpoint_max_epochs: int | None = None
+        resume_checkpoint_patience: int | None = None
         resume_validated_callback: EpochCheckpoint | None = None
         if run_path is not None:
             if continuation_path is not None:
                 (
                     resume_checkpoint,
                     resume_checkpoint_max_epochs,
+                    resume_checkpoint_patience,
                     continuation_lineage,
                 ) = _load_max_epoch_continuation_parent(
                     continuation_path,
@@ -3095,6 +3097,7 @@ def train_run(
             objective_weighting=objective_weighting,
             resume_checkpoint=resume_checkpoint,
             resume_checkpoint_max_epochs=resume_checkpoint_max_epochs,
+            resume_checkpoint_patience=resume_checkpoint_patience,
             epoch_checkpoint_callback=checkpoint_callback,
             resume_validated_callback=resume_validated_callback,
         )
@@ -3232,6 +3235,7 @@ def _fit_condition(
     objective_weighting: GeneObjectiveWeighting | None = None,
     resume_checkpoint: Mapping[str, object] | None = None,
     resume_checkpoint_max_epochs: int | None = None,
+    resume_checkpoint_patience: int | None = None,
     epoch_checkpoint_callback: EpochCheckpoint | None = None,
     resume_validated_callback: EpochCheckpoint | None = None,
 ) -> ConditionResult:
@@ -3303,6 +3307,7 @@ def _fit_condition(
             condition_name=condition_name,
             max_epochs=max_epochs,
             checkpoint_max_epochs=resume_checkpoint_max_epochs,
+            checkpoint_patience=resume_checkpoint_patience,
             patience=patience,
             monitor_enabled=monitor_callback is not None,
             selection_metric=selection_metric_name,
@@ -4588,29 +4593,44 @@ def _continuation_parent_source_commit(
 def _validate_max_epoch_continuation_config(
     parent_config: Mapping[str, object],
     current_config: Mapping[str, object],
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     parent_max_epochs = int(parent_config["training"]["max_epochs"])
     current_max_epochs = int(current_config["training"]["max_epochs"])
-    if current_max_epochs <= parent_max_epochs:
+    parent_patience = int(parent_config["training"]["early_stopping_patience"])
+    current_patience = int(current_config["training"]["early_stopping_patience"])
+    patience_is_unchanged = current_patience == parent_patience
+    patience_is_disabled_to_cap = (
+        current_patience == current_max_epochs
+        and current_patience > parent_patience
+    )
+    if not (patience_is_unchanged or patience_is_disabled_to_cap):
         raise ValueError(
-            "continuation max_epochs must be greater than the parent safety cap"
+            "continuation early_stopping_patience must stay unchanged or be "
+            "raised exactly to the new max_epochs safety cap"
         )
     expected = copy.deepcopy(dict(parent_config))
     expected["training"]["max_epochs"] = current_max_epochs
+    expected["training"]["early_stopping_patience"] = current_patience
     current_profile = current_config["resources"].get("profile_artifact")
     if current_profile is not None or "profile_artifact" in expected["resources"]:
         expected["resources"]["profile_artifact"] = current_profile
     if expected != dict(current_config):
         raise ValueError(
-            "continuation config differs beyond training.max_epochs and the "
-            "source-matched resources.profile_artifact"
+            "continuation config differs beyond training.max_epochs, the "
+            "explicit early-stopping disablement, and the source-matched "
+            "resources.profile_artifact"
         )
     if (
         parent_config["execution"].get("final_test_authorized") is not False
         or current_config["execution"].get("final_test_authorized") is not False
     ):
         raise RuntimeError("training continuation must keep held-out test closed")
-    return parent_max_epochs, current_max_epochs
+    return (
+        parent_max_epochs,
+        current_max_epochs,
+        parent_patience,
+        current_patience,
+    )
 
 
 def _load_max_epoch_continuation_parent(
@@ -4621,7 +4641,7 @@ def _load_max_epoch_continuation_parent(
     genes: Sequence[PreparedGene],
     prepared: PreparedDataset | BackedPreparedDataset | None,
     continuation_run_dir: Path,
-) -> tuple[Mapping[str, object], int, dict[str, object]]:
+) -> tuple[Mapping[str, object], int, int, dict[str, object]]:
     parent_run_dir = path.parent
     expected_latest = parent_run_dir / "latest.pt"
     if path.resolve() != expected_latest.resolve():
@@ -4639,9 +4659,12 @@ def _load_max_epoch_continuation_parent(
     )
     if stored_parent_manifest != asdict(parent_manifest):
         raise ValueError("continuation parent training manifest differs from config")
-    parent_max_epochs, current_max_epochs = _validate_max_epoch_continuation_config(
-        parent_config, current_config
-    )
+    (
+        parent_max_epochs,
+        current_max_epochs,
+        parent_patience,
+        current_patience,
+    ) = _validate_max_epoch_continuation_config(parent_config, current_config)
     parent_source_commit = _continuation_parent_source_commit(parent_config)
     parent_identity = _training_recovery_identity(
         manifest=parent_manifest,
@@ -4653,35 +4676,50 @@ def _load_max_epoch_continuation_parent(
     checkpoint = _load_training_recovery_checkpoint(
         path, expected_identity=parent_identity
     )
-    if checkpoint["completed_epoch"] != parent_max_epochs:
+    completed_epoch = int(checkpoint["completed_epoch"])
+    stopped_at_parent_cap = completed_epoch >= parent_max_epochs
+    stopped_by_parent_patience = (
+        checkpoint["epochs_without_improvement"] >= parent_patience
+    )
+    if not (stopped_at_parent_cap or stopped_by_parent_patience):
         raise ValueError(
-            "continuation parent must have stopped exactly at its max-epoch cap"
+            "continuation parent did not stop at its max-epoch or patience boundary"
         )
     if checkpoint["training_complete"] is not True:
-        raise ValueError("continuation parent max-epoch checkpoint is not terminal")
-    if checkpoint["epochs_without_improvement"] >= int(
-        current_config["training"]["early_stopping_patience"]
-    ):
-        raise ValueError("continuation parent already reached early stopping")
+        raise ValueError("continuation parent checkpoint is not terminal")
+    if current_max_epochs <= completed_epoch:
+        raise ValueError(
+            "continuation max_epochs must exceed the parent's completed epoch"
+        )
+    if checkpoint["epochs_without_improvement"] >= current_patience:
+        raise ValueError(
+            "continuation patience does not reopen the parent early-stop state"
+        )
     lineage = {
-        "schema_version": "fabric.max_epoch_continuation.v1",
+        "schema_version": "fabric.epoch_control_continuation.v1",
         "parent_run_dir": str(parent_run_dir.resolve()),
         "parent_latest_checkpoint": str(path.resolve()),
-        "parent_completed_epoch": parent_max_epochs,
-        "continuation_first_epoch": parent_max_epochs + 1,
+        "parent_completed_epoch": completed_epoch,
+        "continuation_first_epoch": completed_epoch + 1,
         "parent_max_epochs": parent_max_epochs,
         "continuation_max_epochs": current_max_epochs,
+        "parent_early_stopping_patience": parent_patience,
+        "continuation_early_stopping_patience": current_patience,
+        "parent_stop_reason": (
+            "max_epochs" if stopped_at_parent_cap else "early_stopping_patience"
+        ),
         "parent_source_git_commit": parent_source_commit,
         "continuation_source_git_commit": _runtime_source_commit(
             require_clean=current_config["execution"]["scope"] == FULL_COHORT_SCOPE
         ),
         "allowed_config_changes": [
             "training.max_epochs",
+            "training.early_stopping_patience",
             "resources.profile_artifact",
         ],
         "held_out_test_evaluated": False,
     }
-    return checkpoint, parent_max_epochs, lineage
+    return checkpoint, parent_max_epochs, parent_patience, lineage
 
 
 def _load_training_recovery_checkpoint(
@@ -4741,6 +4779,7 @@ def _restore_fit_checkpoint(
     condition_name: str,
     max_epochs: int,
     checkpoint_max_epochs: int | None = None,
+    checkpoint_patience: int | None = None,
     patience: int,
     monitor_enabled: bool,
     selection_metric: str = "validation_compatible_path_nll",
@@ -4757,6 +4796,7 @@ def _restore_fit_checkpoint(
     terminal_max_epochs = (
         max_epochs if checkpoint_max_epochs is None else checkpoint_max_epochs
     )
+    terminal_patience = patience if checkpoint_patience is None else checkpoint_patience
     best_epoch = checkpoint["best_epoch"]
     epochs_without_improvement = checkpoint["epochs_without_improvement"]
     if (
@@ -4840,7 +4880,7 @@ def _restore_fit_checkpoint(
 
     expected_training_complete = (
         completed_epoch >= terminal_max_epochs
-        or epochs_without_improvement >= patience
+        or epochs_without_improvement >= terminal_patience
     )
     if checkpoint["training_complete"] is not expected_training_complete:
         raise ValueError("resume terminal state differs from epoch controls")
