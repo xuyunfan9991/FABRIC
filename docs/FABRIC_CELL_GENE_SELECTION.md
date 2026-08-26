@@ -167,27 +167,25 @@ proper subsets of the gene's matrix structural-path set. The current historical 
 covers only 7,198 genes and cannot be used to assert the size of this new set.
 Validation/test evidence cannot admit a gene or upgrade its reporting tier.
 
-## 6. DTU audit
+## 6. Frozen DTU gene prior
 
 `data/DTU_result_sorted.xlsx` contains the same 28,002 genes as the
 matrix-matched GTF, and its `number_of_transcripts` agrees exactly for every
-gene. This corrects the earlier interpretation that its transcript universe
-was mismatched.
+gene. This workbook is the frozen DTU gene prior; FABRIC does not recompute a
+train-only DTU score and does not place an additional provenance gate in front
+of this prior.
 
 There are 2,844 `top_DTU_gene=yes` genes. The primary catalog contains all 2,841
 canonical high-DTU genes; the remaining 3 are alt-contig genes. DTU metadata
-was joined only after selection and did not control admission, support
-thresholds, loss weights, sampling, early stopping, or model choice. Its score
+was joined only after selection and did not control gene admission or support
+thresholds. Downstream sensitivity runs may use the continuous `DTU_score` as
+the frozen prior defined in the architecture contract. Its historical score
 implementation is available in `data/DTU_score.R`: it first restricts PSI,
 expression, and transcript-to-gene metadata to their common transcript axis,
 requires at least two transcripts and at least two expressed cell types, and
 scores dominant-transcript switching using transcript-wise JS divergence. The
 workbook flag is exactly equivalent to `DTU_score >= 0.7` in the delivered
 28,002-gene table, but that threshold assignment is not present in the R file.
-The R entry point consumes pre-existing 190-cell-type matrices and does not
-record whether formal test cells contributed to those aggregates. Therefore
-the DTU label remains an audit stratum rather than a confirmatory training
-label until its input-matrix and split provenance are closed.
 
 All 4,361 two-transcript genes in the workbook are labelled non-high-DTU under
 the delivered 0.7 cutoff. This is not used as a reason to exclude them from
